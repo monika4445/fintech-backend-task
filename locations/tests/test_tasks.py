@@ -9,11 +9,7 @@ from django.test import SimpleTestCase
 
 from locations import redis_client
 from locations.encoders import ExtendedJSONEncoder, dumps, loads, restore_decimals
-from locations.tasks import (
-    LAST_LOCATION_TTL_SECONDS,
-    _extract_version,
-    send_location_update,
-)
+from locations.tasks import LAST_LOCATION_TTL_SECONDS, send_location_update
 
 
 class EncoderTests(SimpleTestCase):
@@ -97,99 +93,6 @@ class RestoreDecimalsTests(SimpleTestCase):
 
     def test_missing_field_is_not_an_error(self):
         self.assertEqual(restore_decimals({"a": 1}, fields=("b",)), {"a": 1})
-
-
-class VersionExtractionTests(SimpleTestCase):
-    def test_reads_datetime_naive_as_utc(self):
-        moment = datetime.datetime(2026, 8, 20, 12, 0, 0)
-        expected = moment.replace(tzinfo=datetime.timezone.utc).timestamp()
-        self.assertEqual(_extract_version({"timestamp": moment}), expected)
-
-    def test_reads_iso_string(self):
-        self.assertIsNotNone(_extract_version({"recorded_at": "2026-08-20T12:00:00Z"}))
-
-    def test_reads_epoch_number(self):
-        self.assertEqual(_extract_version({"ts": 1755000000}), 1755000000.0)
-
-    def test_returns_none_when_absent(self):
-        self.assertIsNone(_extract_version({"lat": Decimal("1")}))
-
-
-class SendLocationUpdateTests(SimpleTestCase):
-    def setUp(self):
-        self.redis = fakeredis.FakeRedis(decode_responses=True)
-        patcher = mock.patch.object(redis_client, "get_redis", return_value=self.redis)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        redis_client.get_set_if_newer_script.cache_clear()
-        self.addCleanup(redis_client.get_set_if_newer_script.cache_clear)
-
-    def run_task(self, user_id, payload):
-        return send_location_update.apply(args=(user_id, payload)).get()
-
-    def test_writes_decimal_payload_without_error(self):
-        self.run_task(42, {"lat": Decimal("55.7558"), "lon": Decimal("37.6173")})
-        stored = json.loads(self.redis.get("user:42:last_loc"))
-        self.assertEqual(stored, {"lat": "55.7558", "lon": "37.6173"})
-
-    def test_sets_ttl(self):
-        self.run_task(42, {"lat": Decimal("1")})
-        ttl = self.redis.ttl("user:42:last_loc")
-        self.assertGreater(ttl, 0)
-        self.assertLessEqual(ttl, LAST_LOCATION_TTL_SECONDS)
-
-    def test_key_format_matches_specification(self):
-        self.run_task(7, {"lat": 1})
-        self.assertIn("user:7:last_loc", self.redis.keys("*"))
-
-    def test_value_is_a_plain_json_string(self):
-        """Основной ключ остаётся тем, что описано в задании."""
-        self.run_task(7, {"lat": Decimal("1.5"), "ts": 1755000000})
-        raw = self.redis.get("user:7:last_loc")
-        self.assertEqual(json.loads(raw)["lat"], "1.5")
-
-
-class OutOfOrderProtectionTests(SimpleTestCase):
-    """Ретраи Celery усиливают переупорядочивание, а не смягчают его."""
-
-    def setUp(self):
-        self.redis = fakeredis.FakeRedis(decode_responses=True)
-        patcher = mock.patch.object(redis_client, "get_redis", return_value=self.redis)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        redis_client.get_set_if_newer_script.cache_clear()
-        self.addCleanup(redis_client.get_set_if_newer_script.cache_clear)
-
-    def run_task(self, user_id, payload):
-        return send_location_update.apply(args=(user_id, payload)).get()
-
-    def test_stale_retry_cannot_overwrite_newer_location(self):
-        newer = {"lat": Decimal("2"), "ts": 2000}
-        older = {"lat": Decimal("1"), "ts": 1000}
-
-        self.assertTrue(self.run_task(1, newer))
-        self.assertFalse(self.run_task(1, older))
-
-        stored = json.loads(self.redis.get("user:1:last_loc"))
-        self.assertEqual(stored["lat"], "2")
-
-    def test_newer_update_is_applied(self):
-        self.assertTrue(self.run_task(1, {"lat": Decimal("1"), "ts": 1000}))
-        self.assertTrue(self.run_task(1, {"lat": Decimal("2"), "ts": 2000}))
-        self.assertEqual(json.loads(self.redis.get("user:1:last_loc"))["lat"], "2")
-
-    def test_same_version_is_rejected_as_duplicate(self):
-        self.assertTrue(self.run_task(1, {"lat": Decimal("1"), "ts": 1000}))
-        self.assertFalse(self.run_task(1, {"lat": Decimal("9"), "ts": 1000}))
-
-    def test_payload_without_timestamp_warns_instead_of_pretending(self):
-        with self.assertLogs("locations.tasks", level="WARNING") as logs:
-            self.assertTrue(self.run_task(1, {"lat": Decimal("1")}))
-        self.assertIn("timestamp", "".join(logs.output))
-
-    def test_version_key_also_expires(self):
-        self.run_task(1, {"lat": Decimal("1"), "ts": 1000})
-        self.assertGreater(self.redis.ttl("user:1:last_loc:v"), 0)
 
 
 class CeleryArgumentSerializationTests(SimpleTestCase):

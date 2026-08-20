@@ -5,7 +5,12 @@ from django.contrib.auth.models import User
 from django.db import connection, transaction
 from django.test import TestCase, TransactionTestCase, skipUnlessDBFeature
 
-from billing.models import Profile, Transaction, TransactionStatus
+from billing.models import (
+    PROCESSABLE_STATUSES,
+    Profile,
+    Transaction,
+    TransactionStatus,
+)
 from billing.services import process_user_transactions
 
 
@@ -45,19 +50,52 @@ class ProcessUserTransactionsTests(TestCase):
         after = Transaction.objects.get(pk=tx.pk).updated_at
         self.assertGreater(after, before)
 
-    def test_illegal_source_statuses_are_not_touched(self):
-        """refunded -> processed это повторный учёт возвращённых денег."""
+    def test_updates_every_transaction_by_default(self):
+        """Условие требует обновить статус ВСЕХ транзакций пользователя.
+
+        Сужение набора собственным перечнем статусов означало бы, что на данных
+        с любым другим значением status не обработается ничего.
+        """
         user = make_user()
-        refunded = make_tx(user, TransactionStatus.REFUNDED)
-        failed = make_tx(user, TransactionStatus.FAILED)
+        rows = [
+            make_tx(user, TransactionStatus.PENDING),
+            make_tx(user, TransactionStatus.AUTHORIZED),
+            make_tx(user, TransactionStatus.FAILED),
+            make_tx(user, TransactionStatus.REFUNDED),
+        ]
 
         updated = process_user_transactions(user.pk)
 
-        self.assertEqual(updated, 0)
+        self.assertEqual(updated, 4)
+        for tx in rows:
+            tx.refresh_from_db()
+            self.assertEqual(tx.status, TransactionStatus.PROCESSED)
+
+    def test_updates_a_status_the_project_does_not_know_about(self):
+        """status в схеме это varchar(20) без перечня значений."""
+        user = make_user()
+        tx = Transaction.objects.create(user=user, status="hold", amount="1.00")
+
+        self.assertEqual(process_user_transactions(user.pk), 1)
+        tx.refresh_from_db()
+        self.assertEqual(tx.status, TransactionStatus.PROCESSED)
+
+    def test_caller_can_narrow_the_set_explicitly(self):
+        """refunded -> processed это повторный учёт возвращённых денег.
+
+        Запрет доступен вызывающему параметром, но решение принимает он.
+        """
+        user = make_user()
+        pending = make_tx(user, TransactionStatus.PENDING)
+        refunded = make_tx(user, TransactionStatus.REFUNDED)
+
+        updated = process_user_transactions(user.pk, statuses=PROCESSABLE_STATUSES)
+
+        self.assertEqual(updated, 1)
+        pending.refresh_from_db()
         refunded.refresh_from_db()
-        failed.refresh_from_db()
+        self.assertEqual(pending.status, TransactionStatus.PROCESSED)
         self.assertEqual(refunded.status, TransactionStatus.REFUNDED)
-        self.assertEqual(failed.status, TransactionStatus.FAILED)
 
     def test_other_users_transactions_are_untouched(self):
         user = make_user("alice")
@@ -73,12 +111,26 @@ class ProcessUserTransactionsTests(TestCase):
         self.assertEqual(theirs.status, TransactionStatus.PENDING)
         self.assertFalse(Profile.objects.get(user=other).has_processed_transactions)
 
-    def test_is_idempotent(self):
+    def test_repeated_run_reaches_the_same_state(self):
+        """Повторный вызов не портит результат: конечное состояние то же."""
         user = make_user()
-        make_tx(user, TransactionStatus.PENDING)
+        tx = make_tx(user, TransactionStatus.PENDING)
 
         self.assertEqual(process_user_transactions(user.pk), 1)
-        self.assertEqual(process_user_transactions(user.pk), 0)
+        self.assertEqual(process_user_transactions(user.pk), 1)
+
+        tx.refresh_from_db()
+        self.assertEqual(tx.status, TransactionStatus.PROCESSED)
+        self.assertTrue(Profile.objects.get(user=user).has_processed_transactions)
+
+    def test_zero_rows_is_logged_rather_than_silent(self):
+        """Флаг выставляется по условию, но «ноль обработано» должно быть видно."""
+        user = make_user()
+
+        with self.assertLogs("billing.services", level="WARNING") as logs:
+            self.assertEqual(process_user_transactions(user.pk), 0)
+
+        self.assertIn("обновлено 0 транзакций", "".join(logs.output))
         self.assertTrue(Profile.objects.get(user=user).has_processed_transactions)
 
     def test_missing_profile_raises_instead_of_silently_creating(self):
@@ -153,6 +205,13 @@ class RowLockingTests(TransactionTestCase):
     """
 
     def test_concurrent_run_cannot_double_process(self):
+        """Блокировка сериализует конкурентные вызовы.
+
+        Проверяется с явным сужением набора статусов: при обработке всех
+        транзакций подряд повторный проход просто перезаписывает те же строки
+        тем же значением, и по количеству обновлённых строк отличить
+        сериализацию от её отсутствия невозможно.
+        """
         import threading
 
         user = make_user()
@@ -162,7 +221,11 @@ class RowLockingTests(TransactionTestCase):
 
         def worker():
             try:
-                results.append(process_user_transactions(user.pk))
+                results.append(
+                    process_user_transactions(
+                        user.pk, statuses=PROCESSABLE_STATUSES
+                    )
+                )
             except Exception as exc:  # noqa: BLE001
                 errors.append(exc)
             finally:

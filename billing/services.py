@@ -5,10 +5,11 @@
 """
 
 import logging
+from collections.abc import Sequence
 
 from django.db import transaction
 
-from billing.models import PROCESSABLE_STATUSES, Profile, Transaction, TransactionStatus
+from billing.models import Profile, Transaction, TransactionStatus
 
 logger = logging.getLogger(__name__)
 
@@ -29,11 +30,27 @@ FETCH_CHUNK_SIZE = 2_000
 
 
 @transaction.atomic
-def process_user_transactions(user_id: int) -> int:
-    """Переводит обрабатываемые транзакции пользователя в processed.
+def process_user_transactions(
+    user_id: int, *, statuses: Sequence[str] | None = None
+) -> int:
+    """Переводит транзакции пользователя в статус processed.
 
     Всё выполняется в одной транзакции БД: либо применяются и новые статусы, и
     флаг в профиле, либо не применяется ничего.
+
+    По умолчанию обрабатываются ВСЕ транзакции пользователя, как того требует
+    условие. Схема задаёт `status` как varchar(20) и перечня допустимых значений
+    не фиксирует, поэтому сузить обработку собственным набором статусов означало
+    бы на чужих данных не обработать ничего и при этом отметить профиль как
+    обработанный.
+
+    Args:
+        user_id: чьи транзакции обрабатываем.
+        statuses: необязательное сужение набора. Осмысленное значение —
+            `PROCESSABLE_STATUSES`: оно запрещает переходы вида
+            refunded -> processed, то есть повторный учёт уже возвращённых
+            денег. Решение принимает вызывающий, потому что перечень статусов —
+            это знание о предметной области, а не о механике обработки.
 
     Возвращает количество фактически обновлённых транзакций.
 
@@ -64,9 +81,12 @@ def process_user_transactions(user_id: int) -> int:
     # Функции поле profile.user не нужно ни разу, так что join не нужен вовсе.
     profile = Profile.objects.select_for_update().get(user_id=user_id)
 
+    queryset = Transaction.objects.select_for_update().filter(user_id=user_id)
+    if statuses is not None:
+        queryset = queryset.filter(status__in=statuses)
+
     transactions = (
-        Transaction.objects.select_for_update()
-        .filter(user_id=user_id, status__in=PROCESSABLE_STATUSES)
+        queryset
         # order_by обязателен, а не косметика. Без него порядок строк выбирает
         # планировщик, два воркера на пересекающихся наборах берут блокировки в
         # разном порядке и получают deadlock. Общий порядок по pk делает
@@ -92,8 +112,17 @@ def process_user_transactions(user_id: int) -> int:
             user_id,
         )
 
-    # Идемпотентность: повторный вызов не находит обрабатываемых транзакций,
-    # возвращает 0 и не трогает уже выставленный флаг лишним UPDATE.
+    if updated == 0:
+        # Условие требует выставить флаг, поэтому он выставляется и здесь. Но
+        # «профиль отмечен как обработанный, а обработано ноль строк» — это
+        # состояние, о котором надо узнать из логов, а не по расследованию
+        # расхождения в отчётах. Штатно означает, что транзакций просто нет.
+        logger.warning(
+            "process_user_transactions: user_id=%s, обновлено 0 транзакций, "
+            "флаг в профиле всё равно выставляется",
+            user_id,
+        )
+
     if not profile.has_processed_transactions:
         profile.has_processed_transactions = True
         profile.save(update_fields=["has_processed_transactions"])
