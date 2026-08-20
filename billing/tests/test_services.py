@@ -80,6 +80,32 @@ class ProcessUserTransactionsTests(TestCase):
         tx.refresh_from_db()
         self.assertEqual(tx.status, TransactionStatus.PROCESSED)
 
+    def test_unknown_status_is_not_rejected_by_validation(self):
+        """choices на поле сделали бы `hold` невалидным для форм и сериализаторов.
+
+        Это противоречило бы решению обрабатывать все транзакции: схема задаёт
+        status как varchar(20) и перечня значений не фиксирует.
+        """
+        user = make_user()
+        tx = Transaction(user=user, status="hold", amount="1.00")
+        tx.full_clean()  # не должно бросать ValidationError
+        tx.save()
+        self.assertEqual(Transaction.objects.get(pk=tx.pk).status, "hold")
+
+    def test_accepts_a_user_instance_as_well_as_an_id(self):
+        """Условие описывает функцию как берущую пользователя User."""
+        user = make_user()
+        make_tx(user, TransactionStatus.PENDING)
+
+        self.assertEqual(process_user_transactions(user), 1)
+        self.assertTrue(Profile.objects.get(user=user).has_processed_transactions)
+
+    def test_unsaved_user_fails_loudly(self):
+        from django.contrib.auth.models import User as UserModel
+
+        with self.assertRaises(ValueError):
+            process_user_transactions(UserModel(username="ghost"))
+
     def test_caller_can_narrow_the_set_explicitly(self):
         """refunded -> processed это повторный учёт возвращённых денег.
 

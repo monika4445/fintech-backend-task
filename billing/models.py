@@ -3,10 +3,17 @@ from django.db import models
 
 
 class TransactionStatus(models.TextChoices):
-    """Статусы вынесены в тип, а не разбросаны строковыми литералами.
+    """Справочник известных значений `status`, а НЕ ограничение поля.
 
-    Это то, что превращает опечатку "proccessed" из тихой порчи данных в
-    ошибку валидации.
+    Даёт именованные константы вместо строковых литералов в коде, чтобы
+    опечатка `proccessed` была видна на импорте, а не в данных.
+
+    Намеренно не подставляется в `choices` самого поля: схема задания описывает
+    `status` как `varchar(20)` и никакого перечня значений не фиксирует. Объявив
+    `choices`, мы добавили бы ограничение уровня приложения, которого в
+    постановке нет, — и это прямо противоречило бы решению обрабатывать все
+    транзакции независимо от статуса. Значение вроде `hold` из чужой системы
+    должно записываться и обрабатываться, а не отклоняться валидацией формы.
     """
 
     PENDING = "pending", "Ожидает обработки"
@@ -60,11 +67,9 @@ class Transaction(models.Model):
         # функция делает по одному UPDATE на строку.
         db_index=False,
     )
-    status = models.CharField(
-        max_length=20,
-        choices=TransactionStatus.choices,
-        default=TransactionStatus.PENDING,
-    )
+    # varchar(20) ровно так, как в схеме задания: без choices, потому что
+    # перечня допустимых значений постановка не задаёт. См. TransactionStatus.
+    status = models.CharField(max_length=20, default=TransactionStatus.PENDING)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

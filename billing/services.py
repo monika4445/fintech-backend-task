@@ -6,6 +6,7 @@
 
 import logging
 from collections.abc import Sequence
+from typing import Any
 
 from django.db import transaction
 
@@ -31,7 +32,7 @@ FETCH_CHUNK_SIZE = 2_000
 
 @transaction.atomic
 def process_user_transactions(
-    user_id: int, *, statuses: Sequence[str] | None = None
+    user: Any, *, statuses: Sequence[str] | None = None
 ) -> int:
     """Переводит транзакции пользователя в статус processed.
 
@@ -45,7 +46,10 @@ def process_user_transactions(
     обработанный.
 
     Args:
-        user_id: чьи транзакции обрабатываем.
+        user: экземпляр User или его первичный ключ. Условие описывает функцию
+            как берущую пользователя, поэтому объект принимается; id принимается
+            тоже, потому что вызывающему часто нечего передать кроме него, а
+            заставлять его ради этого делать лишний запрос незачем.
         statuses: необязательное сужение набора. Осмысленное значение —
             `PROCESSABLE_STATUSES`: оно запрещает переходы вида
             refunded -> processed, то есть повторный учёт уже возвращённых
@@ -61,6 +65,13 @@ def process_user_transactions(
             создаём профиль на лету, потому что молчаливое создание скрыло бы
             поломку в регистрации пользователя.
     """
+    user_id = getattr(user, "pk", user)
+    if user_id is None:
+        raise ValueError(
+            "process_user_transactions получил несохранённого пользователя: "
+            "у объекта нет первичного ключа"
+        )
+
     # Два уровня блокировки здесь удерживаются сознательно, и решение записано,
     # чтобы его не пришлось выводить заново. Мьютексом служит строка профиля: она
     # берётся первой и сериализует всех вызывающих этой функции. Построчный
