@@ -115,58 +115,61 @@ TIME_ZONE = os.environ.get("TIME_ZONE", "Europe/Moscow")
 # SQLite Django молча выбрасывает FOR UPDATE из запроса
 # (django/db/models/sql/compiler.py), то есть вместе с данными теряется и
 # защита от гонок.
-if os.environ.get("DJANGO_ALLOW_SQLITE") == "1":
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.sqlite3",
-            "NAME": BASE_DIR / "db.sqlite3",
+# SQLite здесь не поддерживается, и это не упущение, а следствие того, что
+# проект опирается на возможности PostgreSQL. Раньше стоял «аварийный» флаг
+# DJANGO_ALLOW_SQLITE, но он не работал: миграции падали на
+# AddIndexConcurrently с TypeError, потому что CONCURRENTLY есть только у
+# постгресового schema editor. Неработающая аварийная дверь хуже её отсутствия —
+# на неё рассчитывают.
+#
+# Помимо миграций от PostgreSQL зависят: SELECT ... FOR UPDATE (на SQLite Django
+# молча выбрасывает его из запроса, django/db/models/sql/compiler.py), тесты на
+# план запроса и сверка схемы через information_schema.
+# Пул соединений на стороне приложения. Без него каждый воркер держит
+# собственное постоянное соединение, и их число равно (воркеры x реплики).
+# Соединение в PostgreSQL это процесс ОС весом порядка десяти мегабайт, так
+# что при полусотне реплик упор идёт в max_connections раньше, чем в CPU
+# базы. Пул разрывает эту связь: число физических соединений перестаёт быть
+# функцией числа реплик.
+#
+# Django запрещает сочетать пул с персистентными соединениями
+# ("Pooling doesn't support persistent connections"), поэтому CONN_MAX_AGE
+# здесь обязан быть нулём — это не оплошность, а требование бэкенда.
+DB_POOL = os.environ.get("DB_POOL", "1") == "1"
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": required_env("POSTGRES_DB"),
+        "USER": required_env("POSTGRES_USER"),
+        "PASSWORD": required_env("POSTGRES_PASSWORD"),
+        "HOST": required_env("POSTGRES_HOST"),
+        "PORT": os.environ.get("POSTGRES_PORT", "5432"),
+    }
+}
+if DB_POOL:
+    DATABASES["default"]["CONN_MAX_AGE"] = 0
+    DATABASES["default"]["OPTIONS"] = {
+        "pool": {
+            "min_size": int(os.environ.get("DB_POOL_MIN", "2")),
+            "max_size": int(os.environ.get("DB_POOL_MAX", "10")),
+            "timeout": 10,
         }
     }
 else:
-    # Пул соединений на стороне приложения. Без него каждый воркер держит
-    # собственное постоянное соединение, и их число равно (воркеры x реплики).
-    # Соединение в PostgreSQL это процесс ОС весом порядка десяти мегабайт, так
-    # что при полусотне реплик упор идёт в max_connections раньше, чем в CPU
-    # базы. Пул разрывает эту связь: число физических соединений перестаёт быть
-    # функцией числа реплик.
-    #
-    # Django запрещает сочетать пул с персистентными соединениями
-    # ("Pooling doesn't support persistent connections"), поэтому CONN_MAX_AGE
-    # здесь обязан быть нулём — это не оплошность, а требование бэкенда.
-    DB_POOL = os.environ.get("DB_POOL", "1") == "1"
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.postgresql",
-            "NAME": required_env("POSTGRES_DB"),
-            "USER": required_env("POSTGRES_USER"),
-            "PASSWORD": required_env("POSTGRES_PASSWORD"),
-            "HOST": required_env("POSTGRES_HOST"),
-            "PORT": os.environ.get("POSTGRES_PORT", "5432"),
-        }
-    }
-    if DB_POOL:
-        DATABASES["default"]["CONN_MAX_AGE"] = 0
-        DATABASES["default"]["OPTIONS"] = {
-            "pool": {
-                "min_size": int(os.environ.get("DB_POOL_MIN", "2")),
-                "max_size": int(os.environ.get("DB_POOL_MAX", "10")),
-                "timeout": 10,
-            }
-        }
-    else:
-        # Режим для PgBouncer в transaction mode: свой пул там лишний, а
-        # персистентные соединения до пулера дешевы.
-        DATABASES["default"]["CONN_MAX_AGE"] = int(
-            os.environ.get("DB_CONN_MAX_AGE", "60")
-        )
-        DATABASES["default"]["CONN_HEALTH_CHECKS"] = True
-        # Обязательно именно в этом режиме. process_user_transactions читает
-        # выборку через .iterator(), то есть через серверный курсор PostgreSQL,
-        # а в transaction pooling соединение возвращается в пул между запросами
-        # и курсор перестаёт существовать — падение с InvalidCursorName, причём
-        # только под нагрузкой, когда соединения реально переиспользуются.
-        # Плата известна: выборка снова материализуется в память целиком.
-        DATABASES["default"]["DISABLE_SERVER_SIDE_CURSORS"] = True
+    # Режим для PgBouncer в transaction mode: свой пул там лишний, а
+    # персистентные соединения до пулера дешевы.
+    DATABASES["default"]["CONN_MAX_AGE"] = int(
+        os.environ.get("DB_CONN_MAX_AGE", "60")
+    )
+    DATABASES["default"]["CONN_HEALTH_CHECKS"] = True
+    # Обязательно именно в этом режиме. process_user_transactions читает
+    # выборку через .iterator(), то есть через серверный курсор PostgreSQL,
+    # а в transaction pooling соединение возвращается в пул между запросами
+    # и курсор перестаёт существовать — падение с InvalidCursorName, причём
+    # только под нагрузкой, когда соединения реально переиспользуются.
+    # Плата известна: выборка снова материализуется в память целиком.
+    DATABASES["default"]["DISABLE_SERVER_SIDE_CURSORS"] = True
+
 
 # ---------------------------------------------------------------------------
 # Redis: брокер и кэш это РАЗНЫЕ инстансы

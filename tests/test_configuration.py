@@ -67,15 +67,23 @@ class FailFastOnMissingConfigTests(SimpleTestCase):
         with self.assertRaises(ImproperlyConfigured):
             load_settings(CELERY_BROKER_URL=None)
 
-    def test_sqlite_requires_explicit_opt_in(self):
+    def test_postgresql_is_the_only_supported_backend(self):
+        """Раньше здесь был флаг DJANGO_ALLOW_SQLITE, и он не работал.
+
+        Миграции падали на AddIndexConcurrently с TypeError: CONCURRENTLY есть
+        только у постгресового schema editor. Неработающая аварийная дверь хуже
+        её отсутствия, потому что на неё рассчитывают.
+        """
         settings = load_settings()
         self.assertEqual(
             settings.DATABASES["default"]["ENGINE"],
             "django.db.backends.postgresql",
         )
-        opted_in = load_settings(DJANGO_ALLOW_SQLITE="1")
+        still_postgres = load_settings(DJANGO_ALLOW_SQLITE="1")
         self.assertEqual(
-            opted_in.DATABASES["default"]["ENGINE"], "django.db.backends.sqlite3"
+            still_postgres.DATABASES["default"]["ENGINE"],
+            "django.db.backends.postgresql",
+            "флаг больше не должен уводить на неподдерживаемый бэкенд",
         )
 
     def test_debug_mode_does_not_require_secret_key(self):
@@ -167,7 +175,7 @@ class BuildAndDeploymentContractTests(SimpleTestCase):
     def test_worker_recycling_is_not_pathologically_frequent(self):
         """django.setup() стоит ~150 мс; порог 1000 съедал ~2% ёмкости."""
         content = (BASE_DIR / "Dockerfile").read_text()
-        line = [x for x in content.splitlines() if "--max-requests\"," in x.replace(" ", "")]
+        self.assertIn("--max-requests", content)
         self.assertIn("10000", content)
 
     def test_image_does_not_carry_curl_just_for_healthchecks(self):
@@ -248,11 +256,9 @@ class BuildAndDeploymentContractTests(SimpleTestCase):
 
     def test_migrations_do_not_block_writes(self):
         """CREATE INDEX держит SHARE, DROP INDEX — ACCESS EXCLUSIVE."""
-        import glob
-
-        migration = pathlib_read = open(
-            glob.glob(str(BASE_DIR / "billing" / "migrations" / "0002_*.py"))[0]
-        ).read()
+        migration = next(
+            (BASE_DIR / "billing" / "migrations").glob("0002_*.py")
+        ).read_text()
         self.assertIn("atomic = False", migration)
         self.assertIn("AddIndexConcurrently", migration)
         self.assertIn("RemoveIndexConcurrently", migration)

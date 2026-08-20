@@ -17,7 +17,6 @@
 import logging
 import os
 import threading
-import time
 from pathlib import Path
 
 from celery.signals import task_postrun, worker_ready, worker_shutdown

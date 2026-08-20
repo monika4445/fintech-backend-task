@@ -2,7 +2,7 @@ from decimal import Decimal
 from unittest import mock
 
 from django.contrib.auth import get_user_model
-from django.db import connection, transaction
+from django.db import connection
 from django.test import TestCase, TransactionTestCase, skipUnlessDBFeature
 
 from billing.models import (
@@ -101,7 +101,7 @@ class ProcessUserTransactionsTests(TestCase):
         import datetime
 
         user = make_user()
-        moment = datetime.datetime(2020, 5, 17, 8, 30, tzinfo=datetime.timezone.utc)
+        moment = datetime.datetime(2020, 5, 17, 8, 30, tzinfo=datetime.UTC)
         tx = Transaction.objects.create(
             user=user, status="pending", amount="1.00", created_at=moment
         )

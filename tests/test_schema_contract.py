@@ -55,12 +55,12 @@ class SchemaMatchesTheAssignmentTests(TestCase):
 
     def test_every_column_from_the_assignment_exists(self):
         for key in EXPECTED:
-            with self.subTest(column="%s.%s" % key):
+            with self.subTest(column=f"{key[0]}.{key[1]}"):
                 self.assertIn(key, self.columns, f"колонка {key} отсутствует")
 
     def test_column_types_match(self):
         for key, (expected_type, _) in EXPECTED.items():
-            with self.subTest(column="%s.%s" % key):
+            with self.subTest(column=f"{key[0]}.{key[1]}"):
                 actual = self.columns.get(key)
                 self.assertIsNotNone(actual, f"колонка {key} отсутствует")
                 self.assertEqual(

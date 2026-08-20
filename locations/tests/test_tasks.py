@@ -112,6 +112,91 @@ class RestoreDecimalsTests(SimpleTestCase):
         self.assertEqual(restore_decimals({"a": 1}, fields=("b",)), {"a": 1})
 
 
+class SendLocationUpdateTests(SimpleTestCase):
+    """Тесты самой функции из условия задачи 2.
+
+    Эти тесты однажды уже были удалены заодно с защитой от переупорядочивания,
+    и репозиторий какое-то время не проверял свой основной ответ на вторую
+    задачу вообще: ни формат ключа, ни TTL, ни то, что Decimal вообще
+    записывается. Соседние тесты покрывали энкодер и сериализацию Celery, то
+    есть механику вокруг, но не сам таск.
+    """
+
+    def setUp(self):
+        self.redis = fakeredis.FakeRedis(decode_responses=True)
+        patcher = mock.patch.object(redis_client, "get_redis", return_value=self.redis)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_task(self, user_id, payload):
+        return send_location_update.apply(args=(user_id, payload)).get()
+
+    def test_key_format_matches_the_specification(self):
+        """Условие задаёт ключ буквально: f"user:{user_id}:last_loc"."""
+        self.run_task(7, {"lat": Decimal("55.7558")})
+        self.assertEqual(self.redis.keys("*"), ["user:7:last_loc"])
+
+    def test_value_is_json_dumps_of_the_payload(self):
+        """И значение задано буквально: json.dumps(location_data)."""
+        self.run_task(7, {"lat": Decimal("55.7558"), "lon": Decimal("37.6173")})
+        raw = self.redis.get("user:7:last_loc")
+        self.assertIsInstance(raw, str)
+        self.assertEqual(json.loads(raw), {"lat": "55.7558", "lon": "37.6173"})
+
+    def test_writes_decimal_datetime_and_uuid(self):
+        """Три типа, названные в условии, плюс вложенность."""
+        self.run_task(
+            42,
+            {
+                "lat": Decimal("55.755826"),
+                "at": datetime.datetime(2026, 8, 20, 12, 30, 45, 123456),
+                "device": uuid.UUID("12345678-1234-5678-1234-567812345678"),
+                "points": [{"amount": Decimal("0.10")}],
+            },
+        )
+        stored = json.loads(self.redis.get("user:42:last_loc"))
+        self.assertEqual(stored["lat"], "55.755826")
+        self.assertEqual(stored["at"], "2026-08-20T12:30:45.123456")
+        self.assertEqual(stored["device"], "12345678-1234-5678-1234-567812345678")
+        self.assertEqual(stored["points"][0]["amount"], "0.10")
+
+    def test_plain_json_dumps_would_have_failed_on_the_same_payload(self):
+        """Фиксируем, что тест проверяет именно исправленный баг."""
+        payload = {"lat": Decimal("55.7558")}
+        with self.assertRaises(TypeError):
+            json.dumps(payload)
+        self.run_task(1, payload)
+        self.assertIsNotNone(self.redis.get("user:1:last_loc"))
+
+    def test_sets_a_ttl(self):
+        """Ключ на пользователя без TTL живёт вечно; см. README."""
+        self.run_task(42, {"lat": Decimal("1")})
+        ttl = self.redis.ttl("user:42:last_loc")
+        self.assertGreater(ttl, 0)
+        self.assertLessEqual(ttl, LAST_LOCATION_TTL_SECONDS)
+
+    def test_writes_only_the_documented_key(self):
+        """Защита от переупорядочивания снята вместе со вторым ключом версии."""
+        self.run_task(42, {"lat": Decimal("1"), "ts": 100})
+        self.assertEqual(self.redis.keys("*"), ["user:42:last_loc"])
+
+    def test_arbitrary_keys_carry_no_special_meaning(self):
+        """Условие обещает работу с любым JSON-совместимым словарём.
+
+        Ключ вроде `ts` в чужих данных может означать что угодно, и таск не
+        должен приписывать ему смысл: последняя запись побеждает.
+        """
+        self.run_task(8, {"ts": 5, "lat": Decimal("1")})
+        self.run_task(8, {"ts": 1, "lat": Decimal("2")})
+        self.assertEqual(json.loads(self.redis.get("user:8:last_loc"))["lat"], "2")
+
+    def test_each_user_gets_their_own_key(self):
+        self.run_task(1, {"lat": Decimal("1")})
+        self.run_task(2, {"lat": Decimal("2")})
+        self.assertEqual(json.loads(self.redis.get("user:1:last_loc"))["lat"], "1")
+        self.assertEqual(json.loads(self.redis.get("user:2:last_loc"))["lat"], "2")
+
+
 class CeleryArgumentSerializationTests(SimpleTestCase):
     """Где именно возникает TypeError из условия задачи."""
 

@@ -24,7 +24,7 @@ class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
             "ts": datetime.datetime.fromtimestamp(
-                record.created, datetime.timezone.utc
+                record.created, datetime.UTC
             ).isoformat(),
             "level": record.levelname,
             "logger": record.name,
