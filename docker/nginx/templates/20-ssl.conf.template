@@ -1,0 +1,36 @@
+server {
+    listen 443 ssl default_server;
+    http2 on;
+    server_name ${DOMAIN} www.${DOMAIN};
+
+    ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+
+    # TLS-параметры заданы явно. include /etc/letsencrypt/options-ssl-nginx.conf
+    # и ssl_dhparam из типовых рецептов создаёт nginx-плагин certbot; при выпуске
+    # через certonly --webroot этих файлов нет, и nginx с несуществующим include
+    # не стартует вообще.
+    ssl_protocols             TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache         shared:SSL:10m;
+    ssl_session_timeout       1d;
+    ssl_session_tickets       off;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    client_max_body_size 20m;
+
+    location /static/ {
+        alias /app/static/;
+        expires 30d;
+        access_log off;
+    }
+
+    location /media/ {
+        alias /app/media/;
+    }
+
+    location / {
+        include /etc/nginx/conf.d/proxy_params.inc;
+    }
+}

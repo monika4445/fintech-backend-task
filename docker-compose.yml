@@ -1,0 +1,149 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-app}
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-app}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      target: base
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py collectstatic --noinput &&
+             exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 3"
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN is required}
+      SECRET_KEY: ${SECRET_KEY:-insecure-development-key}
+      DEBUG: ${DEBUG:-0}
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB:-app}
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - static:/app/static
+      - media:/app/media
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    expose:
+      - "8000"
+
+  worker:
+    build:
+      context: .
+      target: base
+    command: celery -A config worker -l info --concurrency 4
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN is required}
+      SECRET_KEY: ${SECRET_KEY:-insecure-development-key}
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB:-app}
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:1.27-alpine
+    # command НЕ переопределяется намеренно. /docker-entrypoint.sh запускает
+    # весь блок инициализации (envsubst по шаблонам и наши скрипты) только при
+    # условии [ "$$1" = "nginx" ]. Любой `command: sh -c ...` подставляет туда
+    # sh, гейт не открывается, шаблоны молча не рендерятся и nginx поднимается
+    # на дефолтном конфиге. Проверено вживую: симптом это 404 от nginx вместо
+    # проксирования, без единой строки ошибки в логах.
+    # Поэтому периодический reload вынесен в docker-entrypoint.d/50-*.sh.
+    environment:
+      # :? роняет compose с внятным сообщением вместо тихого пустого server_name.
+      DOMAIN: ${DOMAIN:?DOMAIN is required}
+      # Включает штатный 15-local-resolvers.envsh, который кладёт адрес
+      # встроенного DNS докера в NGINX_LOCAL_RESOLVERS. Без него resolver
+      # в шаблоне отрендерится пустым и nginx не стартует.
+      NGINX_ENTRYPOINT_LOCAL_RESOLVERS: "1"
+    volumes:
+      # Шаблоны монтируются, а не копируются в образ. Иначе привязка к домену
+      # уедет в слой образа и пересборка снова понадобится.
+      - ./docker/nginx/templates:/etc/nginx/templates:ro
+      # Монтируются пофайлово, а не каталогом: /docker-entrypoint.d/ ищет
+      # скрипты рекурсивно и сортирует их по полному пути, так что вложенная
+      # папка меняет порядок исполнения неочевидным образом.
+      - ./docker/nginx/entrypoint.d/40-drop-ssl-if-no-cert.sh:/docker-entrypoint.d/40-drop-ssl-if-no-cert.sh:ro
+      - ./docker/nginx/entrypoint.d/50-reload-on-cert-renewal.sh:/docker-entrypoint.d/50-reload-on-cert-renewal.sh:ro
+      - static:/app/static:ro
+      - media:/app/media:ro
+      - certbot-conf:/etc/letsencrypt:ro
+      - certbot-www:/var/www/certbot
+    depends_on:
+      - app
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+
+  certbot:
+    image: certbot/certbot
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN is required}
+    volumes:
+      - certbot-conf:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
+    entrypoint: >
+      sh -c "trap exit TERM;
+             while :; do
+               certbot renew --webroot -w /var/www/certbot --quiet;
+               sleep 12h & wait $${!};
+             done"
+    profiles: ["tls"]
+
+  # Сьюта ходит в настоящий Postgres, а не в SQLite. На SQLite
+  # has_select_for_update = False, и Django молча выкидывает FOR UPDATE из
+  # запроса (django/db/models/sql/compiler.py) — без ошибки и без варнинга.
+  # Тесты при этом зелёные, а защиты от гонки нет вообще.
+  #   docker compose --profile test run --rm test
+  test:
+    build:
+      context: .
+      target: test
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+      SECRET_KEY: test
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB:-app}
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles: ["test"]
+
+volumes:
+  pgdata:
+  static:
+  media:
+  certbot-conf:
+  certbot-www:
