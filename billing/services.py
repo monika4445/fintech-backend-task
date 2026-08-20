@@ -36,15 +36,15 @@ def process_user_transactions(user_id: int) -> int:
             создаём профиль на лету, потому что молчаливое создание скрыло бы
             поломку в регистрации пользователя.
     """
-    # Блокируем только профиль. Строку User эта операция не меняет, и лишний
-    # FOR UPDATE на ней добавил бы ребро в граф ожиданий с любым кодом, который
-    # трогает пользователя (смена email, обновление last_login при логине).
-    # select_related убирает отдельный запрос за пользователем.
-    profile = (
-        Profile.objects.select_for_update()
-        .select_related("user")
-        .get(user_id=user_id)
-    )
+    # Блокируется только строка профиля, и это проверяется тестом по
+    # фактическому SQL, а не утверждается комментарием.
+    #
+    # select_related("user") здесь был бы активно вредным, хотя выглядит как
+    # оптимизация. В PostgreSQL `SELECT ... FOR UPDATE` без `OF` блокирует
+    # строки ВСЕХ таблиц джойна, поэтому join с auth_user означал бы блокировку
+    # пользователя на всё время цикла — то есть ровно то, чего мы избегаем.
+    # Функции поле profile.user не нужно ни разу, так что join не нужен вовсе.
+    profile = Profile.objects.select_for_update().get(user_id=user_id)
 
     transactions = (
         Transaction.objects.select_for_update()

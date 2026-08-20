@@ -2,7 +2,7 @@ from decimal import Decimal
 from unittest import mock
 
 from django.contrib.auth.models import User
-from django.db import connection
+from django.db import connection, transaction
 from django.test import TestCase, TransactionTestCase, skipUnlessDBFeature
 
 from billing.models import Profile, Transaction, TransactionStatus
@@ -178,3 +178,56 @@ class RowLockingTests(TransactionTestCase):
         # Ровно один поток видит транзакцию необработанной, остальные ждут
         # блокировку и после её снятия не находят ничего.
         self.assertEqual(sorted(results), [0, 0, 0, 1])
+
+
+@skipUnlessDBFeature("has_select_for_update")
+class LockScopeTests(TestCase):
+    """Что именно блокируется, проверяется по SQL, а не по комментарию.
+
+    Первая версия этой функции делала
+        Profile.objects.select_for_update().select_related("user")
+    и была снабжена комментарием «блокируется только профиль». Комментарий был
+    неверен: в PostgreSQL `SELECT ... FOR UPDATE` без `OF` блокирует строки ВСЕХ
+    таблиц джойна, так что auth_user блокировался на всё время цикла обновлений.
+    Ни один поведенческий тест этого не видел.
+    """
+
+    def test_profile_lock_does_not_join_or_lock_auth_user(self):
+        from django.test.utils import CaptureQueriesContext
+
+        user = make_user()
+        make_tx(user, TransactionStatus.PENDING)
+
+        with CaptureQueriesContext(connection) as captured:
+            process_user_transactions(user.pk)
+
+        locking = [q["sql"] for q in captured.captured_queries if "FOR UPDATE" in q["sql"]]
+        self.assertTrue(locking, "ожидались блокирующие запросы")
+
+        profile_locks = [sql for sql in locking if '"profile"' in sql]
+        self.assertTrue(profile_locks, "профиль должен блокироваться")
+        for sql in profile_locks:
+            self.assertNotIn(
+                "auth_user",
+                sql,
+                "join с auth_user означает FOR UPDATE и по строке пользователя",
+            )
+
+    def test_transactions_are_locked_in_primary_key_order(self):
+        """Без общего порядка два воркера получают deadlock."""
+        from django.test.utils import CaptureQueriesContext
+
+        user = make_user()
+        for _ in range(3):
+            make_tx(user, TransactionStatus.PENDING)
+
+        with CaptureQueriesContext(connection) as captured:
+            process_user_transactions(user.pk)
+
+        tx_locks = [
+            q["sql"]
+            for q in captured.captured_queries
+            if "FOR UPDATE" in q["sql"] and '"transaction"' in q["sql"]
+        ]
+        self.assertTrue(tx_locks)
+        self.assertIn("ORDER BY", tx_locks[0])

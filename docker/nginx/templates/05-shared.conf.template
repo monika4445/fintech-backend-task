@@ -1,0 +1,26 @@
+# NGINX_LOCAL_RESOLVERS приходит из штатного 15-local-resolvers.envsh образа
+# (включается переменной NGINX_ENTRYPOINT_LOCAL_RESOLVERS) и содержит адрес
+# встроенного DNS докера. valid=10s заставляет перепроверять адрес апстрима,
+# а не кэшировать его навсегда.
+resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
+
+server {
+    listen 80 default_server;
+    server_name _;
+
+    # Healthcheck ходит на 127.0.0.1 без заголовка Host, поэтому попадает
+    # именно сюда, а не в блок домена. Отвечает без обращения к приложению:
+    # это проверка живости nginx, а не сквозная проверка стека.
+    location = /nginx-health {
+        access_log off;
+        return 200 "ok\n";
+    }
+
+    # Запрос с чужим Host не должен попадать в основной блок только потому, что
+    # тот оказался первым в конфиге. 444 закрывает соединение без ответа.
+    # Именно location, а не return на уровне server: серверный return
+    # отрабатывает в фазе rewrite до выбора location и перебил бы healthcheck.
+    location / {
+        return 444;
+    }
+}

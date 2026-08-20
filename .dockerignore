@@ -1,0 +1,26 @@
+# Без этого файла `COPY . .` запекает в слой образа .env с продакшн-секретами,
+# всю историю .git и локальный .venv на 100+ МБ бинарников под чужую платформу.
+# .gitignore защищает только git и на docker не влияет никак. Проверено: файл
+# .env из рабочей копии читался внутри собранного контейнера.
+.env
+.env.*
+!.env.example
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+.git/
+.gitignore
+
+db.sqlite3
+static/
+media/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage

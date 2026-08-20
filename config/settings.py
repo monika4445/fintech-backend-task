@@ -1,27 +1,80 @@
 import os
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = os.environ.get("SECRET_KEY", "insecure-development-key")
+
+def required_env(name: str) -> str:
+    """Обязательная переменная окружения без тихого дефолта.
+
+    Падение на старте — правильное поведение. Дефолт у секрета или у адреса
+    базы означает, что забытая переменная не ломает деплой, а тихо меняет
+    поведение системы: приложение поднимается с публично известным ключом или
+    начинает писать данные не туда, а /healthz при этом отвечает 200.
+    """
+    value = os.environ.get(name, "")
+    if not value:
+        raise ImproperlyConfigured(
+            f"Переменная окружения {name} обязательна и не задана."
+        )
+    return value
+
+
 DEBUG = os.environ.get("DEBUG", "0") == "1"
 
-# Единственный источник правды по домену: его читает и nginx, и Django.
-# Расхождение между ними даёт 400 Bad Request, который выглядит как баг приложения.
-DOMAIN = os.environ.get("DOMAIN", "")
-ALLOWED_HOSTS = [h for h in (DOMAIN, f"www.{DOMAIN}", "localhost", "127.0.0.1") if h]
+# В отладке допускается сгенерированный на лету ключ, в остальных случаях —
+# только явный. Дефолтная строка в коде означала бы подделку сессионных кук и
+# токенов сброса пароля любым, кто читал репозиторий.
+if DEBUG:
+    SECRET_KEY = os.environ.get("SECRET_KEY") or "django-insecure-debug-only"
+else:
+    SECRET_KEY = required_env("SECRET_KEY")
 
-# Django за прокси видит http, а не https. Без этой пары request.is_secure()
-# возвращает False, и secure-флаги на session/csrf-куках не выставляются.
+# Единственный источник правды по домену: его читает и nginx, и Django.
+# Расхождение между ними даёт 400 Bad Request, который выглядит как баг
+# приложения, а не как ошибка конфигурации.
+DOMAIN = os.environ.get("DOMAIN", "")
+if not DOMAIN and not DEBUG:
+    raise ImproperlyConfigured("Переменная окружения DOMAIN обязательна и не задана.")
+
+ALLOWED_HOSTS = [DOMAIN, f"www.{DOMAIN}"] if DOMAIN else []
+if DEBUG:
+    ALLOWED_HOSTS += ["localhost", "127.0.0.1"]
+
+# Схема нужна и обязана совпадать с той, что реально отдаёт nginx.
+CSRF_TRUSTED_ORIGINS = [f"https://{h}" for h in ALLOWED_HOSTS if h not in
+                        ("localhost", "127.0.0.1")]
+
+# ---------------------------------------------------------------------------
+# HTTPS за обратным прокси
+# ---------------------------------------------------------------------------
+# Читается напрямую в HttpRequest.is_secure() (django/http/request.py), никакого
+# middleware для этого не нужно. Без него Django за прокси видит http и
+# is_secure() всегда False.
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
-# SECURE_SSL_REDIRECT намеренно НЕ включается. Редирект на https принадлежит
-# ровно одному слою, и этот слой — nginx.
-# Продублировав его здесь, мы ломаем режим первого запуска: пока сертификата
-# нет, nginx поднимается HTTP-only и проксирует напрямую, а Django всё равно
-# отдаёт 301 на https, которого ещё никто не слушает. Проверено вживую:
-# смена DOMAIN на домен без сертификата давала 301 на мёртвый адрес.
+# А вот эти флаги ни из чего не выводятся: куки помечаются Secure только если
+# сказать об этом явно. Без них SECURE_PROXY_SSL_HEADER на защищённость кук
+# не влияет вообще.
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "Lax"
+
+# SECURE_SSL_REDIRECT намеренно выключен. Редирект на https принадлежит ровно
+# одному слою, и этот слой — nginx. Продублированный здесь, он ломает режим
+# первого запуска: пока сертификата нет, nginx поднимается HTTP-only и
+# проксирует напрямую, а Django всё равно отдаёт 301 на https, которого ещё
+# никто не слушает.
 SECURE_SSL_REDIRECT = False
+
+# Это реализует SecurityMiddleware, и только ради этого он в списке ниже.
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = "same-origin"
+# HSTS отдаёт nginx (add_header в 20-ssl.conf), дублировать не нужно.
+SECURE_HSTS_SECONDS = 0
 
 INSTALLED_APPS = [
     "django.contrib.auth",
@@ -32,10 +85,6 @@ INSTALLED_APPS = [
     "locations",
 ]
 
-# SecurityMiddleware обязателен, иначе SECURE_SSL_REDIRECT и
-# SECURE_PROXY_SSL_HEADER ниже — просто переменные, которые никто не читает.
-# Настройка, которая ничего не делает, хуже отсутствующей: она даёт ложную
-# уверенность при код-ревью.
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -43,29 +92,98 @@ MIDDLEWARE = [
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
-USE_TZ = True
 
-if os.environ.get("POSTGRES_HOST"):
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.postgresql",
-            "NAME": os.environ.get("POSTGRES_DB", "app"),
-            "USER": os.environ.get("POSTGRES_USER", "app"),
-            "PASSWORD": os.environ.get("POSTGRES_PASSWORD", "app"),
-            "HOST": os.environ["POSTGRES_HOST"],
-            "PORT": os.environ.get("POSTGRES_PORT", "5432"),
-        }
-    }
-else:
+USE_TZ = True
+# Иначе действует дефолт Django America/Chicago, и любое приведение к местному
+# времени в отчётах уезжает на девять часов.
+TIME_ZONE = os.environ.get("TIME_ZONE", "Europe/Moscow")
+
+# ---------------------------------------------------------------------------
+# База данных
+# ---------------------------------------------------------------------------
+# SQLite допустим только по явному разрешению. Тихий откат на него при забытом
+# POSTGRES_HOST означал бы, что финансовые транзакции пишутся в файл внутри
+# контейнера и исчезают при рестарте, без единой ошибки в логе. Отдельно на
+# SQLite Django молча выбрасывает FOR UPDATE из запроса
+# (django/db/models/sql/compiler.py), то есть вместе с данными теряется и
+# защита от гонок.
+if os.environ.get("DJANGO_ALLOW_SQLITE") == "1":
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.sqlite3",
             "NAME": BASE_DIR / "db.sqlite3",
         }
     }
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": required_env("POSTGRES_DB"),
+            "USER": required_env("POSTGRES_USER"),
+            "PASSWORD": required_env("POSTGRES_PASSWORD"),
+            "HOST": required_env("POSTGRES_HOST"),
+            "PORT": os.environ.get("POSTGRES_PORT", "5432"),
+            # Без этого синхронные воркеры gunicorn открывают новое соединение
+            # с Postgres на каждый запрос: TCP, аутентификация, настройка сессии.
+            "CONN_MAX_AGE": int(os.environ.get("DB_CONN_MAX_AGE", "60")),
+            "CONN_HEALTH_CHECKS": True,
+        }
+    }
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
-CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", REDIS_URL)
+# ---------------------------------------------------------------------------
+# Redis: брокер и кэш это РАЗНЫЕ инстансы
+# ---------------------------------------------------------------------------
+# Общий инстанс с политикой allkeys-lru вытесняет ключи очереди Celery под
+# нагрузкой, и сообщения пропадают молча: продюсер уже получил подтверждение.
+# Брокер живёт с noeviction и persistence, кэш — с вытеснением.
+CELERY_BROKER_URL = required_env("CELERY_BROKER_URL")
+REDIS_URL = required_env("REDIS_URL")
+
+CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", "")
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_ACCEPT_CONTENT = ["json"]
+# Подтверждение после выполнения, а не до: падение воркера возвращает задачу в
+# очередь вместо тихой потери.
+CELERY_TASK_ACKS_LATE = True
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+
+# ---------------------------------------------------------------------------
+# Логирование
+# ---------------------------------------------------------------------------
+# Django по умолчанию (django/utils/log.py:DEFAULT_LOGGING) закрывает console
+# фильтром require_debug_true, а mail_admins — require_debug_false с пустым
+# ADMINS. То есть при DEBUG=0 необработанное исключение во вью не попадает
+# никуда: ни в stdout, ни в почту. Конфиг ниже это закрывает.
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "verbose": {
+            "format": "%(asctime)s %(levelname)s %(name)s %(process)d %(message)s",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "verbose",
+        },
+    },
+    "root": {"handlers": ["console"], "level": LOG_LEVEL},
+    "loggers": {
+        "django.request": {
+            "handlers": ["console"],
+            "level": "ERROR",
+            "propagate": False,
+        },
+        "django.db.backends": {
+            "handlers": ["console"],
+            "level": os.environ.get("SQL_LOG_LEVEL", "WARNING"),
+            "propagate": False,
+        },
+    },
+}
 
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "static"
