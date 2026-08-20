@@ -5,9 +5,10 @@
 """
 
 import logging
-from collections.abc import Sequence
-from typing import Any
+from collections.abc import Collection
 
+from django.contrib.auth import get_user_model
+from django.contrib.auth.base_user import AbstractBaseUser
 from django.db import transaction
 
 from billing.models import Profile, Transaction, TransactionStatus
@@ -30,9 +31,53 @@ LOCK_DURATION_WARNING_ROWS = 1_000
 FETCH_CHUNK_SIZE = 2_000
 
 
+def _resolve_user_id(user: AbstractBaseUser | int) -> int:
+    """Достаёт первичный ключ, не полагаясь на наличие атрибута `pk`.
+
+    Ранняя версия делала `getattr(user, "pk", user)`. Атрибут `pk` есть у любой
+    модели Django, поэтому переданный по ошибке `Profile` молча сходил за
+    пользователя: функция брала id профиля как id пользователя и обрабатывала
+    транзакции постороннего лица, не подняв ни одной ошибки. Соседство
+    пользователя и профиля в этой же операции делает такую опечатку особенно
+    вероятной.
+    """
+    if isinstance(user, get_user_model()):
+        if user.pk is None:
+            raise ValueError(
+                "process_user_transactions получил несохранённого пользователя: "
+                "у объекта нет первичного ключа"
+            )
+        return user.pk
+    if isinstance(user, int) and not isinstance(user, bool):
+        return user
+    raise TypeError(
+        "process_user_transactions ожидает экземпляр User или его первичный "
+        f"ключ, получено: {type(user).__name__}"
+    )
+
+
+def _validated_statuses(statuses: Collection[str] | None) -> Collection[str] | None:
+    """Отвергает одиночную строку там, где ожидается коллекция строк.
+
+    `statuses="pending"` — частая опечатка, и она тихая: Django развернёт строку
+    посимвольно в `status__in=["p", "e", "n", ...]`, совпадений не найдёт и
+    обработает ноль транзакций, а флаг в профиле всё равно будет выставлен.
+    """
+    if statuses is None:
+        return None
+    if isinstance(statuses, (str, bytes)):
+        raise TypeError(
+            "statuses ожидает коллекцию строк, а не одну строку: "
+            f"передайте ({statuses!r},) вместо {statuses!r}"
+        )
+    return statuses
+
+
 @transaction.atomic
 def process_user_transactions(
-    user: Any, *, statuses: Sequence[str] | None = None
+    user: AbstractBaseUser | int,
+    *,
+    statuses: Collection[str] | None = None,
 ) -> int:
     """Переводит транзакции пользователя в статус processed.
 
@@ -65,12 +110,8 @@ def process_user_transactions(
             создаём профиль на лету, потому что молчаливое создание скрыло бы
             поломку в регистрации пользователя.
     """
-    user_id = getattr(user, "pk", user)
-    if user_id is None:
-        raise ValueError(
-            "process_user_transactions получил несохранённого пользователя: "
-            "у объекта нет первичного ключа"
-        )
+    user_id = _resolve_user_id(user)
+    statuses = _validated_statuses(statuses)
 
     # Два уровня блокировки здесь удерживаются сознательно, и решение записано,
     # чтобы его не пришлось выводить заново. Мьютексом служит строка профиля: она

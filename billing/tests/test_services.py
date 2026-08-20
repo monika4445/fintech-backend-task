@@ -106,6 +106,39 @@ class ProcessUserTransactionsTests(TestCase):
         with self.assertRaises(ValueError):
             process_user_transactions(UserModel(username="ghost"))
 
+    def test_profile_is_not_mistaken_for_a_user(self):
+        """У любой модели Django есть pk, поэтому утиная типизация тут опасна.
+
+        Переданный по ошибке Profile молча брался бы за пользователя: функция
+        взяла бы id профиля как id пользователя и обработала транзакции
+        постороннего лица, не подняв ни одной ошибки.
+        """
+        user = make_user()
+        make_tx(user, TransactionStatus.PENDING)
+        profile = Profile.objects.get(user=user)
+
+        with self.assertRaises(TypeError):
+            process_user_transactions(profile)
+
+    def test_rejects_arbitrary_objects(self):
+        for bad in ("5", 5.0, True, None, object()):
+            with self.subTest(value=bad), self.assertRaises(TypeError):
+                process_user_transactions(bad)
+
+    def test_statuses_rejects_a_bare_string(self):
+        """statuses="pending" развернулось бы посимвольно и дало тихий ноль."""
+        user = make_user()
+        make_tx(user, TransactionStatus.PENDING)
+
+        with self.assertRaises(TypeError) as ctx:
+            process_user_transactions(user.pk, statuses="pending")
+        self.assertIn("коллекцию строк", str(ctx.exception))
+
+        # А корректная коллекция работает.
+        self.assertEqual(
+            process_user_transactions(user.pk, statuses=("pending",)), 1
+        )
+
     def test_caller_can_narrow_the_set_explicitly(self):
         """refunded -> processed это повторный учёт возвращённых денег.
 
