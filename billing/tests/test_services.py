@@ -331,11 +331,18 @@ class LockScopeTests(TestCase):
         Profile.objects.select_for_update().select_related("user")
     и была снабжена комментарием «блокируется только профиль». Комментарий был
     неверен: в PostgreSQL `SELECT ... FOR UPDATE` без `OF` блокирует строки ВСЕХ
-    таблиц джойна, так что auth_user блокировался на всё время цикла обновлений.
-    Ни один поведенческий тест этого не видел.
+    таблиц джойна, так что таблица пользователей блокировалась на всё время
+    цикла обновлений. Ни один поведенческий тест этого не видел.
+
+    Имя таблицы берётся из модели, а не пишется строкой. Первая версия проверяла
+    отсутствие подстроки `auth_user`; после перехода на свою модель таблица стала
+    называться иначе, и утверждение превратилось в тавтологию — оно не упало бы,
+    даже если вернуть `select_related`. Тест, который молча перестал проверять,
+    опаснее отсутствующего.
     """
 
-    def test_profile_lock_does_not_join_or_lock_auth_user(self):
+    def test_profile_lock_does_not_join_the_user_table(self):
+        from django.contrib.auth import get_user_model
         from django.test.utils import CaptureQueriesContext
 
         user = make_user()
@@ -349,11 +356,19 @@ class LockScopeTests(TestCase):
 
         profile_locks = [sql for sql in locking if '"profile"' in sql]
         self.assertTrue(profile_locks, "профиль должен блокироваться")
+
+        user_table = get_user_model()._meta.db_table
         for sql in profile_locks:
             self.assertNotIn(
-                "auth_user",
+                "JOIN",
+                sql.upper(),
+                "блокирующий запрос по профилю не должен содержать джойнов: "
+                "FOR UPDATE без OF заблокирует строки всех таблиц джойна",
+            )
+            self.assertNotIn(
+                f'"{user_table}"',
                 sql,
-                "join с auth_user означает FOR UPDATE и по строке пользователя",
+                f"join с {user_table} означает FOR UPDATE и по строке пользователя",
             )
 
     def test_transactions_are_locked_in_primary_key_order(self):
