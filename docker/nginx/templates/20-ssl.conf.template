@@ -22,7 +22,12 @@ server {
 
     location /static/ {
         alias /app/static/;
-        expires 30d;
+        # Имена файлов содержат хеш содержимого (ManifestStaticFilesStorage),
+        # поэтому URL меняется при каждом деплое и вечный кэш безопасен.
+        # С нехешированными именами тот же заголовок означал бы, что часть
+        # пользователей до года работает со старой статикой.
+        expires 1y;
+        add_header Cache-Control "public, immutable";
         access_log off;
     }
 
@@ -31,6 +36,9 @@ server {
     }
 
     location / {
+        # burst сглаживает нормальную пачку запросов от одного клиента,
+        # nodelay отдаёт их сразу, а не растягивает по rate.
+        limit_req zone=api burst=${RATE_LIMIT_BURST} nodelay;
         include /etc/nginx/conf.d/proxy_params.inc;
     }
 }

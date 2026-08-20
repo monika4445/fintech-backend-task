@@ -30,6 +30,9 @@ app.config_from_object("django.conf:settings", namespace="CELERY")
 #     типы), он обязан ехать двумя релизами: сначала везде accept_content,
 #     только следующим релизом task_serializer. Откат симметричен.
 
+# Импорт подключает обработчики сигналов, иначе heartbeat не запустится.
+from config import worker_health  # noqa: E402,F401
+
 app.autodiscover_tasks()
 
 __all__ = ["app"]

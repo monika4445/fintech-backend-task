@@ -15,6 +15,7 @@ server {
     }
 
     location / {
+        limit_req zone=api burst=${RATE_LIMIT_BURST} nodelay;
         include /etc/nginx/conf.d/proxy_params.inc;
     }
 }

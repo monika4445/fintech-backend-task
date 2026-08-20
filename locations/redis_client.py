@@ -6,6 +6,7 @@ redis.Redis.from_url отдаёт объект с пулом соединени�
 """
 
 import logging
+import os
 from functools import lru_cache
 
 import redis
@@ -37,6 +38,11 @@ def get_redis() -> "redis.Redis":
         socket_timeout=2,
         socket_connect_timeout=2,
         health_check_interval=30,
+        # Пул по умолчанию не ограничен сверху (2**31). При потоковой модели
+        # gunicorn и concurrency воркера это означает, что число сокетов ничем
+        # не сдерживается: упор пойдёт в лимит дескрипторов процесса или в
+        # maxclients Redis, и оба отказа выглядят как загадочные таймауты.
+        max_connections=int(os.environ.get("REDIS_MAX_CONNECTIONS", "20")),
     )
 
 

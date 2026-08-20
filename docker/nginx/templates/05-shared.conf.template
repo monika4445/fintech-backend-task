@@ -4,6 +4,24 @@
 # а не кэшировать его навсегда.
 resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
 
+# JSON-ответы уходили несжатыми: проверено, Accept-Encoding: gzip ничего не
+# менял. На типичном ответе API в единицы килобайт это троекратная переплата за
+# исходящий трафик и соответствующий TTLB на мобильных сетях.
+# min_length отсекает мелочь, где накладные расходы сжатия больше выигрыша.
+gzip              on;
+gzip_vary         on;
+gzip_min_length   1024;
+gzip_comp_level   5;
+gzip_proxied      any;
+gzip_types        application/json application/javascript text/css text/plain
+                  application/xml image/svg+xml;
+
+# Ограничение частоты на периметре. Без него один клиент способен занять всю
+# ёмкость пула воркеров, и это выглядит как отказ сервиса для всех остальных.
+# Зона на 10 МБ вмещает порядка 160 тысяч адресов.
+limit_req_zone    $binary_remote_addr zone=api:10m rate=${RATE_LIMIT_RPS}r/s;
+limit_req_status  429;
+
 server {
     listen 80 default_server;
     server_name _;

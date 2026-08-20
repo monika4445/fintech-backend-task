@@ -108,9 +108,22 @@ class ProductionHardeningTests(SimpleTestCase):
         settings = load_settings()
         self.assertFalse(settings.SECURE_SSL_REDIRECT)
 
-    def test_database_connections_are_reused(self):
-        settings = load_settings()
-        self.assertGreater(settings.DATABASES["default"]["CONN_MAX_AGE"], 0)
+    def test_connections_are_pooled_and_not_also_persistent(self):
+        """Django запрещает сочетать пул с персистентными соединениями.
+
+        "Pooling doesn't support persistent connections" — поэтому при
+        включённом пуле CONN_MAX_AGE обязан быть нулём, а не наоборот.
+        """
+        pooled = load_settings()["default"] if False else load_settings().DATABASES["default"]
+        self.assertIn("pool", pooled["OPTIONS"])
+        self.assertEqual(pooled["CONN_MAX_AGE"], 0)
+        self.assertGreater(pooled["OPTIONS"]["pool"]["max_size"], 0)
+
+    def test_pgbouncer_mode_falls_back_to_persistent_connections(self):
+        """С внешним пулером свой пул лишний, а персистентные соединения дёшевы."""
+        direct = load_settings(DB_POOL="0").DATABASES["default"]
+        self.assertNotIn("pool", direct.get("OPTIONS", {}))
+        self.assertGreater(direct["CONN_MAX_AGE"], 0)
 
     def test_timezone_is_explicit(self):
         settings = load_settings()
@@ -145,6 +158,28 @@ class BuildAndDeploymentContractTests(SimpleTestCase):
         content = (BASE_DIR / "Dockerfile").read_text()
         self.assertIn("--access-logfile", content)
 
+    def test_gunicorn_is_not_limited_to_one_request_per_worker(self):
+        """Синхронная модель обслуживала ровно `workers` запросов одновременно."""
+        content = (BASE_DIR / "Dockerfile").read_text()
+        self.assertIn("gthread", content)
+        self.assertIn("--threads", content)
+
+    def test_worker_recycling_is_not_pathologically_frequent(self):
+        """django.setup() стоит ~150 мс; порог 1000 съедал ~2% ёмкости."""
+        content = (BASE_DIR / "Dockerfile").read_text()
+        line = [x for x in content.splitlines() if "--max-requests\"," in x.replace(" ", "")]
+        self.assertIn("10000", content)
+
+    def test_image_does_not_carry_curl_just_for_healthchecks(self):
+        content = (BASE_DIR / "Dockerfile").read_text()
+        self.assertNotIn("install -y --no-install-recommends libpq5 curl", content)
+
+    def test_copy_does_not_duplicate_the_app_layer(self):
+        """Отдельный chown -R после COPY удваивает вклад приложения в образ."""
+        content = (BASE_DIR / "Dockerfile").read_text()
+        self.assertIn("COPY --chown=app:app", content)
+        self.assertNotIn("chown -R app:app /app", content)
+
     def test_broker_redis_does_not_evict_messages(self):
         content = (BASE_DIR / "docker-compose.yml").read_text()
         broker = content.split("\n  redis-broker:", 1)[1].split("\n  redis-cache:", 1)[0]
@@ -163,6 +198,95 @@ class BuildAndDeploymentContractTests(SimpleTestCase):
         app_block = content.split("\n  app:", 1)[1].split("\n  worker:", 1)[0]
         self.assertNotIn("manage.py migrate", app_block)
         self.assertIn("service_completed_successfully", app_block)
+
+    def test_worker_healthcheck_does_not_boot_an_interpreter_or_use_the_broker(self):
+        """`celery inspect ping` стоил 0.5 с и рассылал broadcast всем воркерам."""
+        content = (BASE_DIR / "docker-compose.yml").read_text()
+        worker = content.split("\n  worker:", 1)[1].split("\n  nginx:", 1)[0]
+        # Только исполняемая строка: в комментарии рядом «inspect ping»
+        # упомянут намеренно, как то, что заменили.
+        probe = next(
+            line for line in worker.splitlines() if line.strip().startswith("test:")
+        )
+        self.assertNotIn("inspect ping", probe)
+        self.assertIn("celery.heartbeat", probe)
+
+    def test_services_have_resource_limits(self):
+        content = (BASE_DIR / "docker-compose.yml").read_text()
+        for service in ("app", "worker", "db", "nginx"):
+            block = content.split(f"\n  {service}:", 1)[1][:600]
+            self.assertIn("mem_limit", block, f"у {service} нет лимита памяти")
+
+    def test_nginx_compresses_responses(self):
+        shared = (
+            BASE_DIR / "docker" / "nginx" / "templates" / "05-shared.conf.template"
+        ).read_text()
+        self.assertIn("gzip              on;", shared)
+        self.assertIn("application/json", shared)
+
+    def test_nginx_rate_limits_the_api(self):
+        shared = (
+            BASE_DIR / "docker" / "nginx" / "templates" / "05-shared.conf.template"
+        ).read_text()
+        ssl = (
+            BASE_DIR / "docker" / "nginx" / "templates" / "20-ssl.conf.template"
+        ).read_text()
+        self.assertIn("limit_req_zone", shared)
+        self.assertIn("limit_req zone=api", ssl)
+
+    def test_static_is_hashed_before_being_cached_forever(self):
+        """Вечный кэш на нехешированных именах отдаёт старую статику после деплоя."""
+        settings = load_settings()
+        self.assertIn(
+            "ManifestStaticFilesStorage",
+            settings.STORAGES["staticfiles"]["BACKEND"],
+        )
+        ssl = (
+            BASE_DIR / "docker" / "nginx" / "templates" / "20-ssl.conf.template"
+        ).read_text()
+        self.assertIn("immutable", ssl)
+
+    def test_migrations_do_not_block_writes(self):
+        """CREATE INDEX держит SHARE, DROP INDEX — ACCESS EXCLUSIVE."""
+        import glob
+
+        migration = pathlib_read = open(
+            glob.glob(str(BASE_DIR / "billing" / "migrations" / "0002_*.py"))[0]
+        ).read()
+        self.assertIn("atomic = False", migration)
+        self.assertIn("AddIndexConcurrently", migration)
+        self.assertIn("RemoveIndexConcurrently", migration)
+
+    def test_celery_task_logs_are_not_two_lines_per_task(self):
+        settings = load_settings()
+        self.assertEqual(
+            settings.LOGGING["loggers"]["celery.app.trace"]["level"], "WARNING"
+        )
+
+    def test_task_arguments_are_not_logged(self):
+        """celery.worker.strategy печатает полные аргументы задачи на INFO.
+
+        Здесь это координаты пользователя, то есть персональные данные в
+        системе сбора логов.
+        """
+        settings = load_settings()
+        self.assertEqual(
+            settings.LOGGING["loggers"]["celery.worker.strategy"]["level"], "WARNING"
+        )
+
+    def test_logs_are_structured(self):
+        settings = load_settings()
+        handler = settings.LOGGING["handlers"]["console"]
+        self.assertEqual(handler["formatter"], "json")
+
+    def test_celery_does_not_replace_the_logging_config(self):
+        """worker_hijack_root_logger по умолчанию True.
+
+        При нём весь блок LOGGING внутри воркера игнорируется, и половина
+        системы пишет текстом, пока вторая пишет JSON.
+        """
+        settings = load_settings()
+        self.assertFalse(settings.CELERY_WORKER_HIJACK_ROOT_LOGGER)
 
     def test_nginx_degraded_mode_uses_separate_templates_not_sed(self):
         script = (
