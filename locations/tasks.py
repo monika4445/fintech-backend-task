@@ -1,9 +1,9 @@
 import logging
 
-from celery import shared_task
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
+from config.celery import app as celery_app
 from locations import redis_client
 from locations.encoders import dumps
 
@@ -17,7 +17,13 @@ LAST_LOCATION_TTL_SECONDS = 24 * 60 * 60
 LAST_LOCATION_KEY = "user:{user_id}:last_loc"
 
 
-@shared_task(
+# Декоратор взят ровно тот, что в условии: @celery_app.task.
+# Обычно в Django-приложении пишут @shared_task, потому что он не привязывает
+# модуль к конкретному экземпляру Celery и не тянет config.celery в импорты
+# приложения. Здесь важнее совпадение с постановкой, а цикла импорта не
+# возникает: config/celery.py создаёт `app` до вызова autodiscover_tasks(),
+# который к тому же выполняется отложенно.
+@celery_app.task(
     # bind=True здесь намеренно НЕ используется: он добавил бы параметр self и
     # тем самым изменил сигнатуру, чего условие прямо запрещает. Ретраи это не
     # мешает: autoretry_for работает без привязки.

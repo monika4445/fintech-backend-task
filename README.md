@@ -89,25 +89,31 @@ Postgres 16, Redis 7. Сьюта: 74 теста, все зелёные, вклю
 
 ```python
 @transaction.atomic
-def process_user_transactions(user_id: int) -> int:
-    profile = (
-        Profile.objects.select_for_update()
-        .select_related("user")
-        .get(user_id=user_id)
-    )
-    transactions = (
-        Transaction.objects.select_for_update()
-        .filter(user_id=user_id)
-        .order_by("pk")
-    )
+def process_user_transactions(
+    user: AbstractBaseUser | int,
+    *,
+    statuses: Collection[str] | None = None,
+) -> int:
+    user_id = _resolve_user_id(user)
+    statuses = _validated_statuses(statuses)
+
+    profile = Profile.objects.select_for_update().get(user_id=user_id)
+
+    queryset = Transaction.objects.select_for_update().filter(user_id=user_id)
+    if statuses is not None:
+        queryset = queryset.filter(status__in=statuses)
+    transactions = queryset.order_by("pk")
+
     updated = 0
-    for tx in transactions:
+    for tx in transactions.iterator(chunk_size=FETCH_CHUNK_SIZE):
         tx.status = TransactionStatus.PROCESSED
         tx.save(update_fields=["status", "updated_at"])
         updated += 1
+
     if not profile.has_processed_transactions:
         profile.has_processed_transactions = True
         profile.save(update_fields=["has_processed_transactions"])
+
     transaction.on_commit(lambda: _notify_processed(user_id, updated))
     return updated
 ```
@@ -274,18 +280,22 @@ round-trip сохраняет и `Decimal`, и микросекунды в `date
 ### Фикс
 
 ```python
-@shared_task(bind=True, max_retries=3, autoretry_for=(RedisConnectionError, ...))
-def send_location_update(self, user_id: int, location_data: dict):
+@celery_app.task(max_retries=3, autoretry_for=(RedisConnectionError, RedisTimeoutError))
+def send_location_update(user_id: int, location_data: dict) -> None:
     payload = dumps(location_data)                     # ExtendedJSONEncoder
     redis_client.get_redis().set(
         f"user:{user_id}:last_loc", payload, ex=LAST_LOCATION_TTL_SECONDS
     )
 ```
 
-Сигнатура по смыслу не изменилась, `bind=True` добавляет только `self`. Проверок
-типов на входе нет: за типы отвечает `default()` энкодера, который вызывается
-только для того, что `json.dumps` не осилил сам, и работает на любой глубине
-вложенности.
+Сигнатура совпадает с исходной. `bind=True` здесь намеренно нет: он добавил бы
+параметр `self` и тем самым изменил бы сигнатуру, чего условие прямо запрещает.
+Ретраи от этого не страдают — `autoretry_for` работает без привязки, а `self`
+в теле не понадобился бы всё равно.
+
+Проверок типов на входе нет: за типы отвечает `default()` энкодера, который
+вызывается только для того, что `json.dumps` не осилил сам, и работает на любой
+глубине вложенности.
 
 ### Что добавлено сверх условия
 
