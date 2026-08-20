@@ -1,5 +1,6 @@
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
 
 class TransactionStatus(models.TextChoices):
@@ -71,7 +72,13 @@ class Transaction(models.Model):
     # перечня допустимых значений постановка не задаёт. См. TransactionStatus.
     status = models.CharField(max_length=20, default=TransactionStatus.PENDING)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
-    created_at = models.DateTimeField(auto_now_add=True)
+    # default, а не auto_now_add. Оба заполняют поле автоматически, но
+    # auto_now_add дополнительно делает его нередактируемым: явно переданное
+    # значение молча игнорируется. Схема задания требует только timestamp, а
+    # тихая потеря переданного значения ломает перенос данных из другой системы
+    # и загрузку фикстур — ровно тот вид отказа, который здесь везде считается
+    # худшим.
+    created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:

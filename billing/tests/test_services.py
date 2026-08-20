@@ -92,6 +92,27 @@ class ProcessUserTransactionsTests(TestCase):
         tx.save()
         self.assertEqual(Transaction.objects.get(pk=tx.pk).status, "hold")
 
+    def test_created_at_can_be_set_explicitly(self):
+        """auto_now_add молча игнорировал бы переданное значение.
+
+        Это ломает перенос данных из другой системы и загрузку фикстур, причём
+        тихо: исключения нет, в базе просто оказывается время импорта.
+        """
+        import datetime
+
+        user = make_user()
+        moment = datetime.datetime(2020, 5, 17, 8, 30, tzinfo=datetime.timezone.utc)
+        tx = Transaction.objects.create(
+            user=user, status="pending", amount="1.00", created_at=moment
+        )
+        tx.refresh_from_db()
+        self.assertEqual(tx.created_at, moment)
+
+    def test_created_at_is_filled_automatically_when_omitted(self):
+        user = make_user()
+        tx = Transaction.objects.create(user=user, status="pending", amount="1.00")
+        self.assertIsNotNone(tx.created_at)
+
     def test_accepts_a_user_instance_as_well_as_an_id(self):
         """Условие описывает функцию как берущую пользователя User."""
         user = make_user()

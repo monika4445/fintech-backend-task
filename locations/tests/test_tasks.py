@@ -53,6 +53,23 @@ class EncoderTests(SimpleTestCase):
         with self.assertRaises(TypeError):
             dumps({"x": Weird()})
 
+    def test_non_string_dict_keys_are_rejected(self):
+        """Граница формата, а не недоработка энкодера.
+
+        json.dumps вызывает default() только для значений; ключи он обрабатывает
+        отдельной веткой. В JSON ключ объекта всегда строка, поэтому словарь с
+        ключом UUID не является JSON-совместимым, и отказ здесь правильный.
+        Тест фиксирует границу, чтобы она была осознанной, а не случайной.
+        """
+        for key in (Decimal("1.5"), uuid.uuid4(), datetime.date(2026, 1, 1)):
+            with self.subTest(key=type(key).__name__):
+                with self.assertRaises(TypeError) as ctx:
+                    dumps({key: "x"})
+                self.assertIn("keys must be", str(ctx.exception))
+
+        # Строковые и целочисленные ключи формат допускает.
+        self.assertEqual(json.loads(dumps({"a": 1, 2: "b"})), {"a": 1, "2": "b"})
+
     def test_bytes_raise_a_useful_error(self):
         with self.assertRaises(TypeError) as ctx:
             dumps({"blob": b"\xff\xfe"})
