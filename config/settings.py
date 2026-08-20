@@ -83,9 +83,15 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     # Нужен для CONCURRENTLY-операций в миграциях billing.0002.
     "django.contrib.postgres",
+    "accounts",
     "billing",
     "locations",
 ]
+
+# Своя модель пользователя. Схема задания объявляет User.id как bigint, а
+# штатная auth.User даёт integer: приложение auth переопределяет
+# DEFAULT_AUTO_FIELD своим AutoField. Подробности — в докстринге accounts.User.
+AUTH_USER_MODEL = "accounts.User"
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",

@@ -1,7 +1,7 @@
 from decimal import Decimal
 from unittest import mock
 
-from django.contrib.auth.models import User
+from django.contrib.auth import get_user_model
 from django.db import connection, transaction
 from django.test import TestCase, TransactionTestCase, skipUnlessDBFeature
 
@@ -15,7 +15,7 @@ from billing.services import process_user_transactions
 
 
 def make_user(username="alice"):
-    user = User.objects.create(username=username, email=f"{username}@example.com")
+    user = get_user_model().objects.create(username=username, email=f"{username}@example.com")
     Profile.objects.create(user=user, has_processed_transactions=False)
     return user
 
@@ -122,10 +122,10 @@ class ProcessUserTransactionsTests(TestCase):
         self.assertTrue(Profile.objects.get(user=user).has_processed_transactions)
 
     def test_unsaved_user_fails_loudly(self):
-        from django.contrib.auth.models import User as UserModel
+        from django.contrib.auth import get_user_model as _gum
 
         with self.assertRaises(ValueError):
-            process_user_transactions(UserModel(username="ghost"))
+            process_user_transactions(_gum()(username="ghost"))
 
     def test_profile_is_not_mistaken_for_a_user(self):
         """У любой модели Django есть pk, поэтому утиная типизация тут опасна.
@@ -214,7 +214,7 @@ class ProcessUserTransactionsTests(TestCase):
         self.assertTrue(Profile.objects.get(user=user).has_processed_transactions)
 
     def test_missing_profile_raises_instead_of_silently_creating(self):
-        user = User.objects.create(username="ghost", email="ghost@example.com")
+        user = get_user_model().objects.create(username="ghost", email="ghost@example.com")
         make_tx(user, TransactionStatus.PENDING)
 
         with self.assertRaises(Profile.DoesNotExist):

@@ -7,7 +7,7 @@ process_user_transactions и поиск транзакций при каскад
 по всей таблице.
 """
 
-from django.contrib.auth.models import User
+from django.contrib.auth import get_user_model
 from django.db import connection
 from django.test import TestCase, skipUnlessDBFeature
 
@@ -69,9 +69,9 @@ class IndexCoverageTests(TestCase):
         )
 
     def setUp(self):
-        self.user = User.objects.create(username="planner", email="p@e.com")
+        self.user = get_user_model().objects.create(username="planner", email="p@e.com")
         Profile.objects.create(user=self.user)
-        background = User.objects.create(username="crowd", email="c@e.com")
+        background = get_user_model().objects.create(username="crowd", email="c@e.com")
         Profile.objects.create(user=background)
         seed(background, BACKGROUND_ROWS)
         seed(self.user, VICTIM_ROWS)
