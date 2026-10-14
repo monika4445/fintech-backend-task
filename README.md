@@ -1,40 +1,39 @@
-# Тестовое задание, Python Backend Developer (FinTech)
+# Test task, Python Backend Developer (FinTech)
 
-Три мини-задачи: атомарная обработка транзакций в Django, Celery-таск, падающий на `Decimal`, и nginx с доменом из переменной окружения. В двух из трёх напрашивающийся ответ неверен, и разобрано здесь в основном это.
+**English** | [Русский](README.ru.md)
 
-| Задача | Что оказалось неочевидным |
+Three mini tasks: atomic transaction processing in Django, a Celery task that fails on `Decimal`, and nginx with the domain taken from an environment variable. In two of the three the obvious answer is wrong, and most of this document is about that.
+
+| Task | What turned out to be non-obvious |
 | --- | --- |
-| [1. Атомарная обработка транзакций](#задача-1-атомарная-обработка-транзакций) | `select_related` рядом с `select_for_update` блокирует ещё и строку пользователя: `FOR UPDATE` без `OF` берёт все таблицы джойна. Логины встают в очередь за пакетной обработкой. Стережётся тестом по фактическому SQL. |
-| [2. `Decimal` не сериализуется в JSON](#задача-2-typeerror-object-of-type-decimal-is-not-json-serializable) | Один и тот же текст ошибки возникает в двух разных местах, и лечатся они по-разному. kombu уже возит `Decimal` сам, поэтому регистрировать свой сериализатор не нужно и вредно. |
-| [3. Домен из переменной окружения](#задача-3-nginx-с-доменом-из-переменной-окружения) | Четыре бага типового рецепта, которые видны только на запущенном стенде. Один из них молча отключает весь рендеринг конфига и не пишет в лог ни строки. |
+| [1. Atomic transaction processing](#task-1-atomic-transaction-processing) | `select_related` next to `select_for_update` also locks the user row: `FOR UPDATE` without `OF` locks every table in the join. Logins queue up behind batch processing. Guarded by a test on the actual SQL. |
+| [2. `Decimal` is not JSON serializable](#task-2-typeerror-object-of-type-decimal-is-not-json-serializable) | The same error text comes from two different places, and they are fixed differently. kombu already carries `Decimal` by itself, so registering a custom serializer is unnecessary and harmful. |
+| [3. Domain from an environment variable](#task-3-nginx-with-the-domain-from-an-environment-variable) | Four bugs in the standard recipe that only show up on a running stack. One of them silently disables all config rendering and doesn't log a single line. |
 
-**Где лежат ответы.** Задача 1 — [`billing/services.py`](billing/services.py) и [`billing/models.py`](billing/models.py). Задача 2 — [`locations/tasks.py`](locations/tasks.py) и [`locations/encoders.py`](locations/encoders.py). Задача 3 — [`docker/nginx/templates/`](docker/nginx/templates) и сервис `nginx` в [`docker-compose.yml`](docker-compose.yml). Это около 370 строк из примерно 1600 в репозитории; остальное — операционный слой, который на вопросы задания не отвечает и помечен ниже как добавленный сознательно.
+**Where the answers are.** Task 1 is in [`billing/services.py`](billing/services.py) and [`billing/models.py`](billing/models.py). Task 2 is in [`locations/tasks.py`](locations/tasks.py) and [`locations/encoders.py`](locations/encoders.py). Task 3 is in [`docker/nginx/templates/`](docker/nginx/templates) and the `nginx` service in [`docker-compose.yml`](docker-compose.yml). That is about 370 of the roughly 1600 lines in the repository; the rest is an operational layer that doesn't answer the task's questions and is marked below as added on purpose.
 
-Всё запускается одной командой, 89 тестов идут против настоящего PostgreSQL, и каждое утверждение ниже проверено на поднятом стенде, а не выведено из чтения кода.
+Everything starts with one command, 89 tests run against a real PostgreSQL, and every claim below was checked on a running stack rather than inferred from reading the code.
 
-**Если времени мало**, посмотрите [инженерный подход](#инженерный-подход), [оптимизации, отклонённые после замера](#отклонено-после-замера) и [то, что не сделано сознательно](#осталось-нерешённым-сознательно). Там видно, как принимались решения, а не только какие.
+**If you're short on time**, look at the [engineering approach](#engineering-approach), the [optimizations rejected after measurement](#rejected-after-measurement) and [what was deliberately left undone](#left-unresolved-on-purpose). They show how decisions were made, not just which ones.
 
-## Как запустить
+## How to run
 
 ```bash
 cp .env.example .env
-python -c "import secrets; print(secrets.token_urlsafe(64))"   # в SECRET_KEY
-docker compose up -d          # db, два redis, migrate, app, worker, nginx, certbot
+python -c "import secrets; print(secrets.token_urlsafe(64))"   # into SECRET_KEY
+docker compose up -d          # db, two redis, migrate, app, worker, nginx, certbot
 curl http://localhost/healthz
 ```
 
-Обязательные переменные (`DOMAIN`, `SECRET_KEY`, `POSTGRES_*`) не имеют дефолтов
-ни в compose, ни в settings. Забытая переменная роняет запуск с внятным
-сообщением — это осознанно, см. раздел про находки финального ревью.
+Required variables (`DOMAIN`, `SECRET_KEY`, `POSTGRES_*`) have no defaults in either compose or settings. A missing variable fails startup with a clear message. This is deliberate, see the section on the final review's findings.
 
-Тесты ходят в настоящий Postgres, отдельной стадией сборки, чтобы тестовые
-зависимости не попадали в прод-образ:
+Tests run against a real Postgres, in a separate build stage so that test dependencies don't end up in the production image:
 
 ```bash
 docker compose --profile test run --rm test
 ```
 
-Локально, без docker:
+Locally, without docker:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -45,68 +44,45 @@ env SECRET_KEY=dev-only DOMAIN=example.com \
     python manage.py test --buffer
 ```
 
-Проверено на Django 6.1, Celery 5.6.3, kombu 5.6.2, psycopg 3.3, nginx 1.27.5,
-Postgres 16, Redis 7. Сьюта: 89 тестов, все зелёные, включая проверку области
-блокировки по фактическому SQL, планов запроса, соответствия схемы из условия
-через `information_schema` и записи в Redis из самого таска.
+Verified on Django 6.1, Celery 5.6.3, kombu 5.6.2, psycopg 3.3, nginx 1.27.5, Postgres 16, Redis 7. Suite: 89 tests, all green, including checks of the lock scope against the actual SQL, query plans, the task's schema via `information_schema`, and the Redis write from the task itself.
 
-## Схема данных
+## Data schema
 
-`Profile` и `Transaction` живут в `billing/models.py` и повторяют условие.
-`User` — в `accounts/models.py`, и это единственное место, где пришлось
-отступить от очевидного решения.
+`Profile` and `Transaction` live in `billing/models.py` and follow the task statement. `User` is in `accounts/models.py`, and it is the one place where I had to depart from the obvious solution.
 
-Сначала здесь стоял штатный `django.contrib.auth.User`: поля `id`, `username`,
-`email` совпадают с условием, а заводить свою модель выглядело как отказ от
-готовой аутентификации ради переписывания того же самого. Ошибка обнаружилась
-не в коде, а в базе. Условие объявляет `User.id` как `bigint`, а штатная модель
-создаёт `integer`: приложение `auth` переопределяет `DEFAULT_AUTO_FIELD` своим
-`default_auto_field = AutoField`, и настройка проекта на него не влияет.
-Снятые с живой базы типы показывали `integer(32,0)` не только у `auth_user.id`,
-но и у `profile.user_id` с `transaction.user_id` — колонка внешнего ключа
-повторяет тип цели, так что одно расхождение давало три.
+At first this used the stock `django.contrib.auth.User`: its `id`, `username` and `email` fields match the statement, and a custom model looked like giving up ready-made authentication only to rewrite the same thing. The mistake showed up not in the code but in the database. The statement declares `User.id` as `bigint`, while the stock model creates an `integer`: the `auth` app overrides `DEFAULT_AUTO_FIELD` with its own `default_auto_field = AutoField`, and the project setting has no effect on it. Types read from the live database showed `integer(32,0)` not only on `auth_user.id` but also on `profile.user_id` and `transaction.user_id`. A foreign key column copies the type of its target, so one mismatch became three.
 
-Само по себе это не срочно: потолок 32-битного ключа около 2.1 миллиарда
-записей. Но менять модель пользователя задним числом в Django болезненно,
-поэтому её и рекомендуют заводить в новом проекте сразу, а здесь данных нет и
-цена перехода нулевая. `accounts.User` наследует `AbstractUser` и переопределяет
-только первичный ключ; полей у него больше, чем в схеме, и это надмножество, а
-не расхождение.
+By itself this isn't urgent: a 32-bit key tops out at about 2.1 billion records. But changing the user model after the fact is painful in Django, which is why it's recommended to create one at the start of a new project, and here there is no data, so the migration costs nothing. `accounts.User` inherits from `AbstractUser` and overrides only the primary key; it has more fields than the schema, which is a superset, not a mismatch.
 
-Расхождение прожило через несколько проходов ревью, потому что все они читали
-код, а не смотрели на созданные таблицы: `DEFAULT_AUTO_FIELD = BigAutoField`
-стоял на месте и выглядел убедительно. Поэтому появился
-`tests/test_schema_contract.py` — он сверяет все двенадцать колонок из условия
-с `information_schema`, включая `varchar(20)`, `decimal(12,2)` и UNIQUE на
-`profile.user_id`.
+The mismatch survived several review passes, because all of them read the code rather than looking at the created tables: `DEFAULT_AUTO_FIELD = BigAutoField` was in place and looked convincing. That's why `tests/test_schema_contract.py` exists. It checks all twelve columns from the statement against `information_schema`, including `varchar(20)`, `decimal(12,2)` and the UNIQUE on `profile.user_id`.
 
 ---
 
-## Инженерный подход
+## Engineering approach
 
-Ниже не принципы вообще, а решения, принятые здесь, вместе с тем, что было отвергнуто и почему. Каждое опирается на что-то проверяемое в этом репозитории.
+These are not general principles but decisions made here, together with what was rejected and why. Each one rests on something you can check in this repository.
 
-**Абстракции по потребности, а не по привычке.** Здесь нет слоёв Service, Repository и DAO: операция выражается ORM напрямую и читается целиком на одном экране. Слой стоило бы завести, чтобы изолировать меняющуюся внешнюю зависимость, убрать заметное дублирование или получить границу для тестов. Ни одного из трёх поводов задание не создаёт, а лишний слой пришлось бы поддерживать вечно.
+**Abstractions on demand, not out of habit.** There are no Service, Repository or DAO layers here: the operation is expressed directly with the ORM and fits on one screen. A layer would be worth adding to isolate a changing external dependency, remove noticeable duplication, or get a test boundary. The task creates none of these three reasons, and an extra layer would have to be maintained forever.
 
-**Границу транзакции видно с первой строки.** `@transaction.atomic` стоит на самой функции, а не на вызывающем коде. Вызывающий не обязан помнить про атомарность, потому что то, о чём надо помнить, рано или поздно забывают.
+**The transaction boundary is visible from the first line.** `@transaction.atomic` sits on the function itself, not in the calling code. The caller doesn't have to remember about atomicity, because whatever has to be remembered eventually gets forgotten.
 
-**Утверждение о поведении сопровождается тестом.** Это не стиль, а следствие конкретной ошибки: комментарий «блокируется только профиль» был неверен, и именно он останавливал проверку — читатель верил тексту вместо SQL. Теперь область блокировки, предикат индекса и план запроса проверяются тестами, а не описываются.
+**A claim about behavior comes with a test.** This isn't style but the result of a specific mistake: a comment saying "only the profile is locked" was wrong, and that comment is what stopped the review, because the reader trusted the text instead of the SQL. Now the lock scope, the index predicate and the query plan are checked by tests rather than described.
 
-**Отказ вместо тихой деградации.** Нет `SECRET_KEY` — падаем на старте, а не поднимаемся с публично известным ключом. Нет адреса базы — падаем, а не пишем финансовые транзакции неизвестно куда. Передали `Profile` вместо `User` или строку вместо коллекции статусов — `TypeError`, а не обработка чужих транзакций и не тихий ноль. Переименовали шаблон nginx — скрипт выходит с кодом 1, а не поднимает половину конфига. Тихая деградация и есть тот класс аварий, который не виден ни в тестах, ни в мониторинге.
+**Fail instead of degrading silently.** No `SECRET_KEY` means failing at startup, not starting with a publicly known key. No database address means failing, not writing financial transactions to an unknown place. Passing a `Profile` instead of a `User`, or a string instead of a collection of statuses, raises `TypeError` instead of processing someone else's transactions or returning a silent zero. A renamed nginx template makes the script exit with code 1 instead of bringing up half a config. Silent degradation is exactly the class of failure that neither tests nor monitoring can see.
 
-**Типы обрабатываются на границе сериализации.** В таске нет ни одной проверки типа на входе: за это отвечает `default()` энкодера, который вызывается только для того, что `json.dumps` не осилил сам, и работает на любой глубине вложенности. Новый тип добавляется в одном месте.
+**Types are handled at the serialization boundary.** The task has no type checks on its input: that's the job of the encoder's `default()`, which is called only for what `json.dumps` can't handle by itself and works at any nesting depth. A new type is added in one place.
 
-**Обратное преобразование по схеме, а не по форме строки.** Ранняя версия угадывала и портила данные, это измерено: `'0042'` превращалось в `Decimal('42')`, а `'NaN'` — в значение, не равное самому себе. Строка `'123'` это и сумма, и почтовый индекс, и внешний ключ; различает их только вызывающий, поэтому список полей передаёт он.
+**Reverse conversion by schema, not by the shape of the string.** An early version guessed and corrupted data, and this was measured: `'0042'` became `Decimal('42')`, and `'NaN'` became a value not equal to itself. The string `'123'` can be an amount, a postal code or a foreign key; only the caller can tell them apart, so the caller passes the list of fields.
 
-**Конфигурация это данные времени запуска.** Домена нет в образе ни в каком виде, что проверено: хеш образа до и после смены `DOMAIN` совпадает. Один и тот же образ работает в любом окружении.
+**Configuration is run-time data.** The domain isn't in the image in any form, and that's verified: the image hash is the same before and after changing `DOMAIN`. The same image runs in any environment.
 
-**Оптимизация только с числом.** Каждое изменение производительности здесь опирается на замер, и четыре напрашивавшиеся оптимизации замером отклонены — например `only()` дал семь процентов вместо ожидавшихся десятков. Отклонённые описаны наравне с принятыми, потому что «попробовала и отказалась» — это тоже результат.
+**Optimize only with a number.** Every performance change here rests on a measurement, and four tempting optimizations were rejected by measurement. For example, `only()` gave seven percent instead of the expected tens. The rejected ones are described alongside the accepted ones, because "tried it and dropped it" is also a result.
 
-**Что не сделано и почему.** Отсутствие keepalive до gunicorn даёт жёсткий потолок примерно в 470 соединений в секунду, и это посчитано, а не оставлено без внимания. Чинится оно не правкой конфига, а решением об архитектуре периметра, поэтому названо, а не сделано наспех. Так же помечено то, что защита от переупорядочивания требует расширения контракта таска, и то, что перечень допустимых переходов статусов — знание о предметной области, которое согласуют с бизнесом, а не угадывают в коде.
+**What wasn't done and why.** No keepalive to gunicorn gives a hard ceiling of about 470 connections per second, and that was calculated rather than ignored. It isn't fixed by a config change but by a decision about the perimeter architecture, so it is named rather than done in a hurry. In the same way, the docs mark that protection against reordering requires extending the task's contract, and that the list of allowed status transitions is domain knowledge to agree with the business, not to guess in code.
 
-## Задача 1. Атомарная обработка транзакций
+## Task 1. Atomic transaction processing
 
-Код в `billing/services.py`, тесты в `billing/tests/test_services.py`.
+Code is in `billing/services.py`, tests in `billing/tests/test_services.py`.
 
 ```python
 @transaction.atomic
@@ -139,168 +115,79 @@ def process_user_transactions(
     return updated
 ```
 
-### Почему именно так
+### Why it's done this way
 
-**`update_fields` включает `updated_at` явно.** Это не перестраховка. Django
-фильтрует список полей по `update_fields` до вызова `pre_save`
-(`django/db/models/base.py`, строка 1090 в 6.1), а `auto_now` реализован именно
-через `pre_save`. Без явного упоминания время модификации молча не обновится, и
-заметить это можно будет только по расхождению в отчётах. Зафиксировано тестом
-`test_updated_at_moves_despite_update_fields`.
+**`update_fields` includes `updated_at` explicitly.** This isn't overcaution. Django filters the field list by `update_fields` before calling `pre_save` (`django/db/models/base.py`, line 1090 in 6.1), and `auto_now` is implemented exactly through `pre_save`. Without naming it explicitly, the modification time silently doesn't update, and you'd only notice from discrepancies in reports. Covered by the test `test_updated_at_moves_despite_update_fields`.
 
-**Блокируется только строка профиля, и это проверяется по SQL.** Здесь стоит
-задержаться, потому что напрашивающаяся оптимизация даёт прямо обратный эффект.
-Вариант `Profile.objects.select_for_update().select_related("user")` выглядит
-как экономия одного запроса, но в PostgreSQL `SELECT ... FOR UPDATE` без `OF`
-блокирует строки **всех** таблиц джойна. Снятый с живой базы SQL:
+**Only the profile row is locked, and this is checked against the SQL.** This deserves a closer look, because the tempting optimization has exactly the opposite effect. `Profile.objects.select_for_update().select_related("user")` looks like it saves one query, but in PostgreSQL `SELECT ... FOR UPDATE` without `OF` locks the rows of **every** table in the join. SQL captured from the live database:
 
 ```
 SELECT ... FROM "profile" INNER JOIN "auth_user" ON (...) WHERE ... FOR UPDATE
 ```
 
-То есть `auth_user` блокируется на всё время цикла обновлений, и любой логин с
-обновлением `last_login` встаёт в очередь. Поле `profile.user` функции не нужно
-ни разу, поэтому джойна здесь нет вовсе. Тест
-`LockScopeTests.test_profile_lock_does_not_join_the_user_table` фиксирует это
-по тексту запроса, а не по поведению: поведенческий тест такую разницу не видит.
+So `auth_user` stays locked for the whole update loop, and any login that updates `last_login` waits in line. The function never needs `profile.user`, so there's no join here at all. The test `LockScopeTests.test_profile_lock_does_not_join_the_user_table` pins this by the query text rather than by behavior, because a behavioral test can't see the difference.
 
-**`order_by("pk")` обязателен.** Без него порядок строк выбирает планировщик,
-два воркера на пересекающихся наборах берут блокировки в разном порядке и
-получают deadlock. Общий порядок по первичному ключу делает захват согласованным
-между всеми процессами. Это ровно тот баг, который не воспроизводится в тестах и
-проявляется в проде под нагрузкой.
+**`order_by("pk")` is required.** Without it the planner chooses the row order, two workers on overlapping sets take locks in different orders and deadlock. A common order by primary key makes lock acquisition consistent across all processes. This is exactly the kind of bug that doesn't reproduce in tests and shows up in production under load.
 
-**Обрабатываются все транзакции, а сужение — решение вызывающего.** Условие
-требует обновить статус всех транзакций, а схема описывает `status` просто как
-`varchar(20)` и никакого перечня значений не задаёт. Поэтому по умолчанию
-фильтра нет.
+**All transactions are processed, and narrowing is the caller's decision.** The statement requires updating the status of all transactions, and the schema describes `status` simply as `varchar(20)` without any list of values. So by default there is no filter.
 
-Соблазн ввести здесь машину состояний велик и по сути верен: переходы
-`refunded → processed` и `failed → processed` означают повторный учёт уже
-возвращённых денег. Но сделать это умолчанием — значит на чужих данных со
-статусом вроде `new` или `hold` не обработать ничего и при этом выставить
-профилю флаг «обработано». Тихий ноль хуже, чем отсутствие защиты. Поэтому
-`PROCESSABLE_STATUSES` доступен параметром `statuses`, а перечень статусов
-остаётся знанием о предметной области, которого у этой функции нет.
+The temptation to add a state machine here is strong and correct in spirit: the transitions `refunded → processed` and `failed → processed` mean counting money that was already refunded a second time. But making that the default means that on someone else's data with a status like `new` or `hold`, nothing gets processed and the profile still gets the "processed" flag. A silent zero is worse than no protection. So `PROCESSABLE_STATUSES` is available through the `statuses` parameter, and the list of statuses stays domain knowledge this function doesn't have.
 
-Отдельно: когда обновлено ноль строк, флаг всё равно выставляется, как требует
-условие, но в лог уходит warning. Состояние «профиль отмечен, обработано ноль»
-должно обнаруживаться из логов, а не расследованием расхождений в отчётах.
+Separately: when zero rows are updated, the flag is still set as the statement requires, but a warning goes to the log. The state "profile marked, zero processed" should be discoverable from logs, not by investigating report discrepancies.
 
-**Побочный эффект вынесен в `on_commit`.** Внутри `atomic` отправка события или
-Celery-таска публикует факт, которого может не случиться при откате, и хуже
-того — воркер успевает забрать задачу раньше коммита и не находит данных. Это
-частая продовая гонка, которая выглядит как плавающие `DoesNotExist`.
+**The side effect is moved into `on_commit`.** Sending an event or a Celery task inside `atomic` publishes a fact that may not happen if the transaction rolls back. Worse, the worker can pick up the task before the commit and not find the data. This is a common production race that looks like intermittent `DoesNotExist` errors.
 
-**Профиль отсутствует — падаем громко.** Схема гарантирует `UNIQUE` на
-`user_id`, но не гарантирует наличие строки. Создавать профиль на лету значило
-бы замаскировать поломку в регистрации пользователя.
+**A missing profile fails loudly.** The schema guarantees `UNIQUE` on `user_id` but doesn't guarantee the row exists. Creating a profile on the fly would hide a broken user registration.
 
-**Индекс на `(user_id, id)`.** Выборка идёт по `user_id` и упорядочена по `id`.
-Без индекса это seq scan по всей таблице транзакций под `SELECT FOR UPDATE`, то
-есть время удержания блокировки растёт вместе с историей, а не с размером
-обрабатываемой пачки. Индексировать вместо этого пару `(user_id, status)` было
-бы ошибкой, и здесь она была совершена: разбор — в разделе про частичный индекс
-ниже.
+**An index on `(user_id, id)`.** The query filters by `user_id` and orders by `id`. Without an index, that's a seq scan over the whole transactions table under `SELECT FOR UPDATE`, so lock hold time grows with history rather than with the size of the batch being processed. Indexing the pair `(user_id, status)` instead would be a mistake, and that mistake was made here: the analysis is in the section on the partial index below.
 
-### Что добавлено сверх условия и почему
+### What was added beyond the statement and why
 
-Функция принимает и экземпляр `User`, и его первичный ключ. Условие описывает её
-как берущую пользователя, а вызывающему часто нечего передать кроме id, и
-заставлять его ради этого делать лишний запрос незачем. Несохранённый объект без
-`pk` отвергается с внятной ошибкой, а не роняет запрос глубже по стеку.
+The function accepts both a `User` instance and its primary key. The statement describes it as taking a user, but often the caller has nothing but an id, and there's no reason to make it run an extra query for that. An unsaved object without a `pk` is rejected with a clear error instead of failing a query deeper in the stack.
 
-Есть необязательный параметр `statuses`. В условии его нет, умолчание совпадает
-с условием — обрабатываются все транзакции. Он существует, чтобы вызывающий мог
-запретить переходы вида `refunded → processed`, то есть повторный учёт уже
-возвращённых денег, не заставляя эту функцию притворяться, будто она знает
-перечень статусов чужой системы.
+There is an optional `statuses` parameter. It's not in the statement, and its default matches the statement: all transactions are processed. It exists so the caller can forbid transitions like `refunded → processed`, meaning counting refunded money a second time, without making this function pretend it knows the status list of someone else's system.
 
-У поля `status` намеренно **нет** `choices`. Схема задания описывает его как
-`varchar(20)` и перечня значений не фиксирует, поэтому объявить `choices` значило
-бы добавить ограничение уровня приложения, которого в постановке нет, — и
-противоречить решению обрабатывать все транзакции. Значение вроде `hold` из
-чужой системы обязано записываться и обрабатываться, а не отклоняться валидацией
-формы; это закреплено тестом с `full_clean()`. `TransactionStatus` остаётся
-справочником именованных констант, чтобы опечатка `proccessed` ломалась на
-импорте, а не в данных.
+The `status` field deliberately has **no** `choices`. The task's schema describes it as `varchar(20)` and doesn't fix a list of values, so declaring `choices` would add an application-level constraint that isn't in the statement, and would contradict the decision to process all transactions. A value like `hold` from another system must be written and processed, not rejected by form validation; this is pinned by a test with `full_clean()`. `TransactionStatus` stays as a set of named constants, so a typo like `proccessed` breaks on import rather than in the data.
 
-### Цена ограничения «только save()»
+### The cost of the "only save()" constraint
 
-Запрет `bulk_update` означает один UPDATE на строку. При RTT до базы в 1 мс это
-примерно секунда удержания блокировок на каждую тысячу транзакций, и всё это
-время конкурирующие процессы по этому пользователю стоят. Это потолок, а не
-деталь реализации. В коде стоит `LOCK_DURATION_WARNING_ROWS`, который пишет
-предупреждение в лог, когда пачка становится опасно большой — чтобы о потолке
-узнали из логов, а не из мониторинга. При реальном росте объёмов правильный
-следующий шаг это резать операцию на батчи с осознанным отказом от глобальной
-атомарности в пользу ограниченной длительности блокировки, и это решение
-принимает не автор функции.
+Forbidding `bulk_update` means one UPDATE per row. With a 1 ms round trip to the database, that's about a second of lock hold time per thousand transactions, and for all that time competing processes for this user wait. This is a ceiling, not an implementation detail. The code has `LOCK_DURATION_WARNING_ROWS`, which logs a warning when a batch gets dangerously large, so the ceiling is found in the logs rather than in monitoring. With real growth in volume, the right next step is to split the operation into batches, deliberately giving up global atomicity in exchange for bounded lock duration, and that decision isn't the function author's to make.
 
-### Что здесь важнее всего знать
+### The most important thing to know here
 
-**На SQLite этот код не защищает ни от чего, и молча.** У SQLite-бэкенда
-`has_select_for_update = False`, а компилятор запросов проверяет
-`if self.query.select_for_update and features.has_select_for_update`
-(`django/db/models/sql/compiler.py`, строка 840). Условие не выполняется,
-`FOR UPDATE` просто не попадает в SQL. Ни исключения, ни предупреждения. Тесты
-зелёные, защиты нет. Поэтому сьюта здесь ходит в Postgres, а тест на
-конкуренцию помечен `@skipUnlessDBFeature("has_select_for_update")`, чтобы на
-SQLite он честно скипался, а не создавал ложную уверенность.
+**On SQLite this code protects against nothing, and silently.** The SQLite backend has `has_select_for_update = False`, and the query compiler checks `if self.query.select_for_update and features.has_select_for_update` (`django/db/models/sql/compiler.py`, line 840). The condition is false, and `FOR UPDATE` simply doesn't make it into the SQL. No exception, no warning. The tests are green and there's no protection. That's why the suite here runs against Postgres, and the concurrency test is marked `@skipUnlessDBFeature("has_select_for_update")`, so on SQLite it is honestly skipped instead of creating false confidence.
 
-Тест `test_concurrent_run_cannot_double_process` запускает четыре потока на одну
-необработанную транзакцию и требует результат `[0, 0, 0, 1]`. На Postgres
-проходит, то есть блокировка действительно берётся.
+The test `test_concurrent_run_cannot_double_process` starts four threads on one unprocessed transaction and requires the result `[0, 0, 0, 1]`. It passes on Postgres, which means the lock really is taken.
 
 ---
 
-## Задача 2. `TypeError: Object of type Decimal is not JSON serializable`
+## Task 2. `TypeError: Object of type Decimal is not JSON serializable`
 
-Код в `locations/encoders.py` и `locations/tasks.py`, тесты в
-`locations/tests/test_tasks.py`.
+Code is in `locations/encoders.py` and `locations/tasks.py`, tests in `locations/tests/test_tasks.py`.
 
-### Сначала диагноз, потом фикс
+### Diagnosis first, then the fix
 
-Одинаковый текст ошибки возможен в двух разных местах, и лечатся они по-разному.
+The same error text can come from two different places, and they are fixed differently.
 
-В веб-процессе, на `.delay()`, когда kombu сериализует аргументы таска. Тогда
-правка тела таска не поможет вообще.
+In the web process, on `.delay()`, when kombu serializes the task arguments. In that case changing the task body doesn't help at all.
 
-В воркере, когда `json.dumps` работает в теле таска.
+In the worker, when `json.dumps` runs in the task body.
 
-Различить их можно только по трейсбеку, и это первое, что надо сделать. Ответ
-«поставьте свой энкодер» без этой развилки чинит половину случаев.
+Only the traceback tells them apart, and checking it is the first thing to do. The answer "just add your own encoder" without this fork fixes half the cases.
 
-### Проверенный факт, который меняет ответ
+### A verified fact that changes the answer
 
-Штатный celery-сериализатор `"json"` это не `json.dumps` из стандартной
-библиотеки, а `kombu.utils.json`. Начиная с 5.x он сам возит `Decimal`,
-`datetime`, `date`, `time` и `UUID` через типизированный конверт вида
-`{"__type__": "decimal", "__value__": "55.7558"}` и на стороне воркера
-восстанавливает их обратно в исходный тип.
+Celery's default `"json"` serializer is not `json.dumps` from the standard library but `kombu.utils.json`. Since 5.x it carries `Decimal`, `datetime`, `date`, `time` and `UUID` by itself, through a typed envelope like `{"__type__": "decimal", "__value__": "55.7558"}`, and restores them to the original type on the worker side.
 
-Проверено на kombu 5.6.2, тест `test_kombu_json_already_handles_decimal_datetime_uuid`:
-round-trip сохраняет и `Decimal`, и микросекунды в `datetime`, и тип `UUID`.
+Verified on kombu 5.6.2, test `test_kombu_json_already_handles_decimal_datetime_uuid`: the round trip preserves `Decimal`, the microseconds in `datetime`, and the `UUID` type.
 
-Отсюда два следствия.
+This has two consequences.
 
-Первое: продюсер на `Decimal` не падает, значит ошибка из условия приходит
-только из тела таска. Диагноз однозначен. Более того, именно потому, что kombu
-честно довозит `Decimal` до воркера, аргумент внутри таска и оказывается
-настоящим `Decimal`, на котором спотыкается голый `json.dumps`. Это зафиксировано
-тестом `test_task_body_receives_real_decimal`.
+First: the producer doesn't fail on `Decimal`, so the error in the statement can only come from the task body. The diagnosis is unambiguous. What's more, precisely because kombu faithfully delivers `Decimal` to the worker, the argument inside the task really is a `Decimal`, which is what a bare `json.dumps` trips over. This is pinned by the test `test_task_body_receives_real_decimal`.
 
-Второе, и более важное: **регистрировать свой content type через
-`kombu.serialization.register` здесь не нужно и вредно.** Выгоды ноль, а цена
-реальная — это ломающее изменение при раскатке. Воркеры, у которых нового типа
-нет в `accept_content`, отбивают сообщения с `ContentDisallowed`, и таски
-теряются в окне деплоя. Если такой переход всё же нужен (старый kombu, свои
-типы), он обязан ехать двумя релизами: сначала везде расширяется
-`accept_content`, и только следующим релизом переключается `task_serializer`.
-Откат симметричен и тоже двухфазный. Это записано в `config/celery.py` рядом с
-решением не делать этого.
+Second, and more important: **registering your own content type through `kombu.serialization.register` is unnecessary and harmful here.** The benefit is zero, and the cost is real: it's a breaking change during rollout. Workers that don't have the new type in `accept_content` reject messages with `ContentDisallowed`, and tasks are lost during the deploy window. If such a migration is ever needed (an old kombu, custom types), it has to ship in two releases: first `accept_content` is extended everywhere, and only in the next release is `task_serializer` switched. Rollback is symmetric and also two-phase. This is written in `config/celery.py` next to the decision not to do it.
 
-### Фикс
+### The fix
 
 ```python
 @celery_app.task(max_retries=3, autoretry_for=(RedisConnectionError, RedisTimeoutError))
@@ -311,415 +198,210 @@ def send_location_update(user_id: int, location_data: dict) -> None:
     )
 ```
 
-Сигнатура совпадает с исходной. `bind=True` здесь намеренно нет: он добавил бы
-параметр `self` и тем самым изменил бы сигнатуру, чего условие прямо запрещает.
-Ретраи от этого не страдают — `autoretry_for` работает без привязки, а `self`
-в теле не понадобился бы всё равно.
+The signature matches the original. There's deliberately no `bind=True`: it would add a `self` parameter and so change the signature, which the statement explicitly forbids. Retries don't suffer from this: `autoretry_for` works without binding, and `self` wouldn't be needed in the body anyway.
 
-Проверок типов на входе нет: за типы отвечает `default()` энкодера, который
-вызывается только для того, что `json.dumps` не осилил сам, и работает на любой
-глубине вложенности.
+There are no type checks on the input: types are the job of the encoder's `default()`, which is called only for what `json.dumps` can't handle itself and works at any nesting depth.
 
-### Что добавлено сверх условия
+### What was added beyond the statement
 
-Запись идёт с TTL в сутки (`ex=`). В условии срока жизни нет — там сказано просто
-записать значение. Добавлено сознательно: Redis это память, а не диск, и ключ на
-пользователя без срока жизни живёт вечно, включая тех, кто ушёл год назад. При
-миллионе пользователей это сотни мегабайт, которые никогда не освобождаются.
-Обратная сторона названа прямо: через сутки без обновлений координата исчезает,
-и потребитель обязан быть к этому готов.
+The write uses a one-day TTL (`ex=`). The statement has no expiry, it just says to write the value. This was added deliberately: Redis is memory, not disk, and a per-user key without an expiry lives forever, including for users who left a year ago. With a million users that's hundreds of megabytes that are never freed. The downside is stated plainly: after a day without updates the location disappears, and the consumer has to be ready for that.
 
-Также добавлены ретраи на сетевых ошибках Redis. Сигнатуру они не трогают:
-`autoretry_for` работает без `bind=True`, что и позволило обойтись без параметра
-`self`.
+Retries on Redis network errors were also added. They don't touch the signature: `autoretry_for` works without `bind=True`, which is what made it possible to do without a `self` parameter.
 
-### Почему свой энкодер, а не `DjangoJSONEncoder`
+### Why a custom encoder and not `DjangoJSONEncoder`
 
-`DjangoJSONEncoder` решает ту же задачу в одну строку, но режет микросекунды до
-миллисекунд (`if o.microsecond: r = r[:23] + r[26:]`) и переписывает суффикс
-`+00:00` в `Z`. Для координат неважно, для финансовых меток времени это
-необратимая потеря, которую никто не замечает до первой сверки. Разница
-зафиксирована тестом `test_microseconds_survive_unlike_djangojsonencoder`.
+`DjangoJSONEncoder` solves the same problem in one line, but it truncates microseconds to milliseconds (`if o.microsecond: r = r[:23] + r[26:]`) and rewrites the `+00:00` suffix to `Z`. For coordinates that doesn't matter; for financial timestamps it's an irreversible loss that nobody notices until the first reconciliation. The difference is pinned by the test `test_microseconds_survive_unlike_djangojsonencoder`.
 
-`Decimal` уходит строкой, а не `float`. `float(Decimal("0.1"))` необратим, и для
-денежных сумм это прямая потеря точности.
+`Decimal` goes out as a string, not a `float`. `float(Decimal("0.1"))` can't be reversed, and for money amounts that's a direct loss of precision.
 
-Модуль зависит только от стандартной библиотеки, потому что импортируется до
-того, как поднимется реестр приложений Django.
+The module depends only on the standard library, because it's imported before Django's app registry is ready.
 
-### Что ещё в этом таске было не так
+### What else was wrong with this task
 
-**Ключ без TTL.** Redis это память, а не диск. Ключ на пользователя без срока
-жизни живёт вечно, включая пользователей, которые ушли год назад. При миллионе
-пользователей это сотни мегабайт, которые никогда не освобождаются.
+**A key without a TTL.** Redis is memory, not disk. A per-user key without an expiry lives forever, including for users who left a year ago. With a million users that's hundreds of megabytes that are never freed.
 
-**Клиент Redis создаётся один раз на процесс** (`locations/redis_client.py`) и
-сбрасывается по сигналу `worker_process_init`. `Redis.from_url` на каждый вызов
-таска означает новый TCP-коннект на каждое сообщение и упирание в лимит
-файловых дескрипторов задолго до лимита Redis. Сброс после fork нужен отдельно:
-сокет, открытый в родительском процессе, оказался бы общим у всех детей
-prefork-воркера, и два процесса читали бы из одного дескриптора вперемешку
-чужие ответы.
+**The Redis client is created once per process** (`locations/redis_client.py`) and reset on the `worker_process_init` signal. `Redis.from_url` on every task call means a new TCP connection for every message and hitting the file descriptor limit long before Redis's own limit. The reset after fork is needed separately: a socket opened in the parent process would be shared by all children of a prefork worker, and two processes would read each other's replies from one descriptor, mixed together.
 
-**Обратное преобразование по списку полей, а не по форме строки.**
-`restore_decimals(data, fields=("lat", "lon"))` возвращает `Decimal` только тем
-полям, которые назвал вызывающий. Первая версия угадывала: пробовала
-`Decimal(value)` на каждой строке и при успехе подменяла тип. Так делать нельзя,
-и это не теоретическое возражение, а измеренная порча данных:
+**Reverse conversion by a list of fields, not by the shape of the string.** `restore_decimals(data, fields=("lat", "lon"))` returns `Decimal` only for the fields the caller named. The first version guessed: it tried `Decimal(value)` on every string and swapped the type on success. That can't be done, and this isn't a theoretical objection but measured data corruption:
 
 ```
-'0042'  -> Decimal('42')     потеря ведущих нулей в номере карты
-'01234' -> Decimal('1234')   испорченный почтовый индекс
-'1e5'   -> Decimal('1E+5')   внешний идентификатор стал числом
-'NaN'   -> Decimal('NaN')    значение, не равное самому себе
+'0042'  -> Decimal('42')     leading zeros lost in a card number
+'01234' -> Decimal('1234')   corrupted postal code
+'1e5'   -> Decimal('1E+5')   an external identifier became a number
+'NaN'   -> Decimal('NaN')    a value not equal to itself
 ```
 
-Последний случай самый неприятный: `Decimal('NaN') != Decimal('NaN')`, так что
-любое сравнение ниже по стеку начинает молча возвращать False. Угадать тип по
-форме строки невозможно в принципе: `'123'` — это и сумма, и почтовый индекс, и
-внешний ключ, различает их только схема, которую знает вызывающий.
+The last case is the nastiest: `Decimal('NaN') != Decimal('NaN')`, so any comparison further down the stack starts silently returning False. Guessing the type from the shape of a string is impossible in principle: `'123'` can be an amount, a postal code or a foreign key, and only the schema the caller knows can tell them apart.
 
-**Переупорядочивание найдено, но закрыть его в рамках условия нельзя.** Celery
-не гарантирует порядок доставки, а `autoretry_for` опасность усиливает:
-повторная попытка старой задачи затрёт свежую координату более старой, молча и
-без ошибки.
+**Reordering was found, but it can't be closed within the statement.** Celery doesn't guarantee delivery order, and `autoretry_for` makes the danger worse: a retry of an old task overwrites a fresh location with an older one, silently and without an error.
 
-Защита была написана — Lua-скрипт, атомарно сравнивающий версию входящих данных
-с сохранённой, — и затем снята. Причина в том, что версию неоткуда взять, не
-нарушив условие. Аргументом её не передать: сигнатура зафиксирована. Достать из
-payload по ключам `timestamp`, `ts` и подобным — значит приписать смысл ключам
-чужого словаря, который по условию может быть любым, и в чужих данных `ts`
-вполне может означать не время. Цена такой ошибки — тихо отброшенное
-легитимное обновление, то есть ровно тот класс отказа, от которого защита и
-задумывалась.
+A protection was written, a Lua script that atomically compares the incoming data's version with the stored one, and then removed. The reason is that there's nowhere to get the version from without breaking the statement. It can't be passed as an argument, because the signature is fixed. Taking it from the payload by keys like `timestamp`, `ts` and so on would mean assigning meaning to keys of someone else's dictionary, which by the statement can be anything, and in someone else's data `ts` may well not mean time. The cost of such a mistake is a silently dropped legitimate update, exactly the class of failure the protection was meant to prevent.
 
-Правильное решение — расширить контракт: версия приходит явным аргументом или
-заголовком сообщения. Это изменение постановки, а не реализации, поэтому здесь
-оно названо, а не сымитировано.
+The right solution is to extend the contract: the version arrives as an explicit argument or a message header. That's a change to the requirements, not the implementation, so here it's named rather than faked.
 
 ---
 
-## Задача 3. Nginx с доменом из переменной окружения
+## Task 3. Nginx with the domain from an environment variable
 
-Конфиги в `docker/nginx/`, оркестрация в `docker-compose.yml`.
+Configs are in `docker/nginx/`, orchestration in `docker-compose.yml`.
 
-Официальный образ nginx с версии 1.19 сам прогоняет `/etc/nginx/templates/*.template`
-через `envsubst` при старте контейнера и кладёт результат в `/etc/nginx/conf.d/`.
-Никакого своего entrypoint и никакой пересборки образа. Шаблоны монтируются
-томом, а не копируются в образ — иначе привязка к домену уехала бы в слой образа
-и пересборка снова понадобилась бы.
+Since version 1.19 the official nginx image runs `/etc/nginx/templates/*.template` through `envsubst` at container start and puts the result into `/etc/nginx/conf.d/`. No custom entrypoint and no image rebuild. The templates are mounted as a volume rather than copied into the image; otherwise the domain binding would end up in an image layer and a rebuild would be needed again.
 
-Смена домена это правка `.env` плюс
-`docker compose up -d --force-recreate nginx app`. Проверено: хеш образа до и
-после смены `DOMAIN` не меняется.
+Changing the domain means editing `.env` plus `docker compose up -d --force-recreate nginx app`. Verified: the image hash doesn't change before and after changing `DOMAIN`.
 
-### Четыре бага типового рецепта, найденных запуском
+### Four bugs in the standard recipe, found by running it
 
-Ниже то, что не видно при чтении конфига и вылезает только на живом стенде.
+These aren't visible when reading the config and only show up on a live stack.
 
-**`include /etc/letsencrypt/options-ssl-nginx.conf` и `ssl_dhparam` не
-существуют.** Эти файлы создаёт nginx-плагин certbot, а при выпуске через
-`certonly --webroot` их нет. nginx с несуществующим include не стартует вообще.
-Поэтому TLS-параметры заданы в шаблоне явно.
+**`include /etc/letsencrypt/options-ssl-nginx.conf` and `ssl_dhparam` don't exist.** These files are created by certbot's nginx plugin, and when issuing with `certonly --webroot` they aren't there. nginx with a missing include doesn't start at all. So the TLS parameters are set explicitly in the template.
 
-**`certbot renew` не перезагружает nginx.** Сертификат обновится на диске, а
-nginx продолжит держать в памяти старый. Через 90 дней сайт отдаёт истёкший
-сертификат при формально работающем автопродлении, и узнаёшь об этом от
-пользователей. `--deploy-hook` между контейнерами не дотянется, поэтому
-периодический reload живёт в самом контейнере nginx
-(`docker/nginx/entrypoint.d/50-reload-on-cert-renewal.sh`).
+**`certbot renew` doesn't reload nginx.** The certificate is renewed on disk, but nginx keeps the old one in memory. After 90 days the site serves an expired certificate while auto-renewal is formally working, and you find out from users. A `--deploy-hook` can't reach across containers, so the periodic reload lives in the nginx container itself (`docker/nginx/entrypoint.d/50-reload-on-cert-renewal.sh`).
 
-**Переопределение `command` отключает весь templating, молча.**
-`/docker-entrypoint.sh` открывает блок инициализации только при условии
-`[ "$1" = "nginx" ]`. Любой `command: sh -c "..."` подставляет туда `sh`, гейт не
-открывается, шаблоны не рендерятся, и nginx поднимается на дефолтном конфиге. Ни
-одной строки ошибки в логах, симптом это 404 вместо проксирования. Именно на
-этом я и споткнулась, когда вешала reload-петлю через `command`. Поэтому `command`
-не переопределяется, а всё дополнительное живёт в `/docker-entrypoint.d/`.
+**Overriding `command` disables all templating, silently.** `/docker-entrypoint.sh` opens its initialization block only when `[ "$1" = "nginx" ]`. Any `command: sh -c "..."` puts `sh` there, the gate doesn't open, the templates aren't rendered, and nginx starts on the default config. Not a single error line in the logs; the symptom is a 404 instead of proxying. This is exactly what I tripped over when I attached the reload loop through `command`. So `command` isn't overridden, and everything extra lives in `/docker-entrypoint.d/`.
 
-**Статический `upstream` залипает на старом IP контейнера.** nginx резолвит имя
-из `upstream django { server app:8000; }` один раз при старте и держит адрес до
-перезапуска. После `docker compose up -d app` контейнер получает новый IP, и
-nginx отдаёт 502 на каждый запрос: `connect() failed (113: Host is unreachable)
-... upstream: 172.18.0.5:8000`. То есть штатный деплой приложения кладёт сайт до
-ручного рестарта прокси. Решение — `resolver` с адресом встроенного DNS докера
-плюс `proxy_pass` через переменную, что заставляет резолвить в рантайме.
+**A static `upstream` sticks to the container's old IP.** nginx resolves the name in `upstream django { server app:8000; }` once at startup and keeps the address until restart. After `docker compose up -d app` the container gets a new IP, and nginx returns 502 on every request: `connect() failed (113: Host is unreachable) ... upstream: 172.18.0.5:8000`. So a normal application deploy takes the site down until the proxy is restarted by hand. The solution is a `resolver` with the address of Docker's built-in DNS plus `proxy_pass` through a variable, which forces resolution at runtime.
 
-Проверено принудительной сменой IP (приложение переехало с `172.18.0.4` на
-`172.18.0.7`, nginx не перезапускался): ответ остался 200.
+Verified by forcing an IP change (the application moved from `172.18.0.4` to `172.18.0.7`, nginx wasn't restarted): the response stayed 200.
 
-Размен здесь сделан осознанно: с переменной в `proxy_pass` пропадает пул
-keepalive до gunicorn, каждый запрос открывает новое TCP-соединение внутри
-docker-сети. Это доли миллисекунды против 502 на каждом деплое. И `$request_uri`
-в `proxy_pass` обязателен: при использовании переменной nginx не подставляет
-совпавшую часть URI автоматически, и без него все запросы уехали бы в корень.
+The tradeoff here is deliberate: with a variable in `proxy_pass` the keepalive pool to gunicorn is lost, and each request opens a new TCP connection inside the docker network. That's fractions of a millisecond versus a 502 on every deploy. And `$request_uri` in `proxy_pass` is required: with a variable, nginx doesn't substitute the matched part of the URI automatically, and without it every request would go to the root.
 
-**Автопродление было спрятано за профилем compose.** Сервис `certbot` стоял под
-`profiles: ["tls"]`, а инструкция документировала запуск как
-`docker compose up -d`. Compose не поднимает сервисы из профиля без явного флага,
-то есть по задокументированной инструкции certbot не стартовал никогда.
-Reload-петля в nginx при этом работала исправно, просто перезагружать было
-нечего. Профиль убран.
+**Auto-renewal was hidden behind a compose profile.** The `certbot` service sat under `profiles: ["tls"]`, while the instructions documented startup as `docker compose up -d`. Compose doesn't start services in a profile without an explicit flag, so following the documented instructions, certbot never started. The reload loop in nginx worked fine, there was just nothing to reload. The profile was removed.
 
-### Из чего состоит compose и что здесь сверх задания
+### What compose consists of and what's beyond the task
 
-Условие описывает исходный `docker-compose.yml` как «приложение (Django + Gunicorn) и Nginx». Здесь девять сервисов, и разделение такое.
+The statement describes the original `docker-compose.yml` as "the application (Django + Gunicorn) and Nginx". There are nine services here, split as follows.
 
-Отвечают на задание: `app` (Django под Gunicorn), `nginx`, `db` (первая задача без базы не проверяется) и `redis-cache` (вторая задача пишет именно в Redis).
+These answer the task: `app` (Django under Gunicorn), `nginx`, `db` (the first task can't be checked without a database) and `redis-cache` (the second task writes specifically to Redis).
 
-Добавлены сознательно, с причиной у каждого. `redis-broker` отделён от кэша, потому что политика вытеснения у них противоположная: кэшу нужен `allkeys-lru`, а брокеру он стоил бы молча потерянных сообщений. `worker` нужен, чтобы вторую задачу можно было проверить через настоящую очередь, а не только вызовом в том же процессе. `migrate` вынесен отдельным одноразовым запуском, иначе `--scale app=3` накатывает миграции тремя контейнерами одновременно. `certbot` продлевает сертификат, без него автопродление из третьей задачи существует только на бумаге. `test` — отдельная стадия сборки, чтобы тестовые зависимости не попадали в прод-образ.
+These were added deliberately, each with a reason. `redis-broker` is separate from the cache because their eviction policies are opposite: the cache needs `allkeys-lru`, and for the broker that would mean silently lost messages. `worker` is there so the second task can be checked through a real queue, not only by a call in the same process. `migrate` is a separate one-off run, otherwise `--scale app=3` would run migrations from three containers at once. `certbot` renews the certificate; without it, auto-renewal from the third task exists only on paper. `test` is a separate build stage so test dependencies don't end up in the production image.
 
-Проверить решение третьей задачи можно, прочитав только `nginx`, `app` и каталог шаблонов; остальное к нему отношения не имеет.
+You can check the third task's solution by reading only `nginx`, `app` and the templates directory; the rest has nothing to do with it.
 
-### Тупик первого запуска
+### The first-run deadlock
 
-Сертификата при первом запуске ещё нет, nginx с `ssl_certificate` на
-несуществующий файл не стартует, а без работающего nginx certbot не пройдёт
-webroot-проверку. Это самый забываемый пункт задачи: формально требование «при
-смене DOMAIN не пересобирать образ» выполняется и без него, но на практике смена
-домена даёт простой, а не переключение.
+On first run there's no certificate yet, nginx with `ssl_certificate` pointing at a missing file doesn't start, and without a working nginx certbot can't pass the webroot check. This is the most often forgotten part of the task: formally the requirement "don't rebuild the image when DOMAIN changes" is met without it, but in practice changing the domain causes downtime instead of a switchover.
 
-`docker/nginx/entrypoint.d/40-select-tls-mode.sh` отрабатывает после envsubst и
-выбирает один из двух готовых шаблонов: `10-http-redirect.conf` при наличии
-сертификата и `10-http-direct.conf` при его отсутствии. ACME-челлендж доступен в
-обоих режимах, сертификат выпускается, рестарт включает HTTPS.
+`docker/nginx/entrypoint.d/40-select-tls-mode.sh` runs after envsubst and picks one of two ready templates: `10-http-redirect.conf` when a certificate exists and `10-http-direct.conf` when it doesn't. The ACME challenge is available in both modes, the certificate gets issued, and a restart turns on HTTPS.
 
-Раньше тот же эффект достигался правкой соседнего конфига через `sed`,
-привязанный к отступу и точной формулировке строки. Любое переформатирование
-шаблона превратило бы его в тихий no-op с кодом возврата 0, и 80-й порт
-редиректил бы на несуществующий HTTPS. Два отдельных файла убирают этот класс
-ошибки целиком, а скрипт дополнительно падает с ненулевым кодом, если ожидаемого
-файла после envsubst не оказалось.
+Previously the same effect was achieved by editing the neighboring config with `sed`, tied to the indentation and the exact wording of a line. Any reformatting of the template would have turned it into a silent no-op with exit code 0, and port 80 would redirect to a non-existent HTTPS. Two separate files remove this class of error entirely, and the script also fails with a non-zero code if the expected file isn't there after envsubst.
 
-### Как выпустить сертификат в первый раз
+### How to issue the certificate the first time
 
-Сервис `certbot` в `docker-compose.yml` выполняет только `certbot renew`, а
-`renew` при отсутствии сертификатов не делает ничего. Первый выпуск — отдельная
-разовая команда, и без неё система остаётся в режиме HTTP-only навсегда.
+The `certbot` service in `docker-compose.yml` only runs `certbot renew`, and `renew` does nothing when there are no certificates. The first issuance is a separate one-off command, and without it the system stays HTTP-only forever.
 
 ```bash
-# 1. Поднять стек. Сертификата нет, nginx стартует в режиме HTTP-only
-#    и отдаёт ACME-челлендж по HTTP.
+# 1. Bring up the stack. There's no certificate, so nginx starts in HTTP-only
+#    mode and serves the ACME challenge over HTTP.
 docker compose up -d
 
-# 2. Выпустить сертификат. Домен берётся из того же DOMAIN.
-#    --entrypoint обязателен: штатный entrypoint сервиса это `sh -c "<цикл
-#    renew>"`, и без переопределения аргументы ниже попадут в $0/$1 скрипта,
-#    будут молча проигнорированы, а контейнер уйдёт в цикл продления.
+# 2. Issue the certificate. The domain comes from the same DOMAIN.
+#    --entrypoint is required: the service's default entrypoint is `sh -c "<renew
+#    loop>"`, and without overriding it the arguments below would land in the
+#    script's $0/$1, be silently ignored, and the container would go into the
+#    renewal loop.
 docker compose run --rm --entrypoint certbot certbot certonly \
     --webroot -w /var/www/certbot \
     -d "$DOMAIN" -d "www.$DOMAIN" \
     --email you@example.com --agree-tos --no-eff-email
 
-# 3. Перезапустить nginx: режим выбирается один раз при старте контейнера,
-#    поэтому reload здесь не поможет.
+# 3. Restart nginx: the mode is picked once at container start,
+#    so a reload won't help here.
 docker compose up -d --force-recreate nginx
 ```
 
-Дальше сертификат продлевает сервис `certbot` сам, а nginx перечитывает его
-каждые шесть часов (`docker/nginx/entrypoint.d/50-reload-on-cert-renewal.sh`).
+After that the `certbot` service renews the certificate by itself, and nginx re-reads it every six hours (`docker/nginx/entrypoint.d/50-reload-on-cert-renewal.sh`).
 
-Домен должен резолвиться на этот сервер, иначе Let's Encrypt не пройдёт
-проверку — это требование ACME, а не особенность конфигурации.
+The domain has to resolve to this server, otherwise Let's Encrypt won't pass the check. That's an ACME requirement, not a quirk of the configuration.
 
-### Домен это не только nginx
+### The domain isn't only nginx
 
-`ALLOWED_HOSTS` в Django собирается из того же `DOMAIN`. Без этого — 400 Bad
-Request, который выглядит как баг приложения.
+Django's `ALLOWED_HOSTS` is built from the same `DOMAIN`. Without that you get a 400 Bad Request that looks like an application bug.
 
-`SECURE_PROXY_SSL_HEADER` в паре с `proxy_set_header X-Forwarded-Proto` нужен,
-чтобы `request.is_secure()` возвращал правду и secure-флаги на session- и
-csrf-куках выставлялись.
+`SECURE_PROXY_SSL_HEADER` together with `proxy_set_header X-Forwarded-Proto` is needed so that `request.is_secure()` tells the truth and the secure flags on the session and csrf cookies get set.
 
-А вот `SECURE_SSL_REDIRECT` в Django намеренно выключен, и это тоже находка со
-стенда. Редирект на https принадлежит ровно одному слою, и этот слой nginx.
-Продублированный в Django, он ломает режим первого запуска: nginx поднят
-HTTP-only и проксирует напрямую, а Django всё равно отдаёт 301 на https,
-которого ещё никто не слушает. Проверено: смена `DOMAIN` на домен без
-сертификата давала 301 на мёртвый адрес, пока владение редиректом не было
-сведено к одному слою.
+`SECURE_SSL_REDIRECT` in Django, on the other hand, is deliberately off, and that's also a finding from the stack. The redirect to https belongs to exactly one layer, and that layer is nginx. Duplicated in Django, it breaks first-run mode: nginx is up HTTP-only and proxies directly, while Django still returns a 301 to https that nobody is listening on yet. Verified: changing `DOMAIN` to a domain without a certificate gave a 301 to a dead address until ownership of the redirect was reduced to one layer.
 
-`SecurityMiddleware` при этом добавлен в `MIDDLEWARE`. Без него
-`SECURE_PROXY_SSL_HEADER` и соседние настройки это просто переменные, которые
-никто не читает. Настройка, которая ничего не делает, хуже отсутствующей: она
-даёт ложную уверенность при код-ревью.
+`SecurityMiddleware` is added to `MIDDLEWARE`. Without it, `SECURE_PROXY_SSL_HEADER` and the neighboring settings are just variables nobody reads. A setting that does nothing is worse than a missing one: it gives false confidence in code review.
 
-### Что проверено на живом стенде
+### What was verified on a live stack
 
-| Проверка | Результат |
+| Check | Result |
 | --- | --- |
-| HTTP на известном домене | 301 на `https://localhost/healthz` |
-| HTTPS сквозь nginx в Django | 200, `secure: true`, `forwarded_proto: https` |
-| ACME-челлендж на HTTP | 200 в обоих режимах, без редиректа |
-| Запрос с чужим Host на 80 | соединение закрыто (444) |
-| Запрос с чужим Host на 443 | 400 от `ALLOWED_HOSTS` |
-| `/nginx-health` через default_server | 200 |
-| Смена `DOMAIN` | образ не пересобирается, новый домен обслуживается |
-| Домен без сертификата | HTTP-only, проксирование работает, ACME доступен |
-| Смена IP контейнера app | 200 без рестарта nginx |
-| Переименование шаблона | скрипт падает с кодом 1, а не тихо |
+| HTTP on the known domain | 301 to `https://localhost/healthz` |
+| HTTPS through nginx into Django | 200, `secure: true`, `forwarded_proto: https` |
+| ACME challenge over HTTP | 200 in both modes, no redirect |
+| Request with a foreign Host on 80 | connection closed (444) |
+| Request with a foreign Host on 443 | 400 from `ALLOWED_HOSTS` |
+| `/nginx-health` via default_server | 200 |
+| Changing `DOMAIN` | image not rebuilt, new domain served |
+| Domain without a certificate | HTTP-only, proxying works, ACME reachable |
+| Changing the app container's IP | 200 without restarting nginx |
+| Renaming a template | script fails with code 1, not silently |
 
 ---
 
-## Что нашёл финальный гейт
+## What the final gate found
 
-Отдельный проход по всему коду с презумпцией отказа нашёл 18 проблем, из которых
-шесть были внесены предыдущими исправлениями. Это само по себе результат: раунд,
-объявивший себя сошедшимся, ошибся. Ниже то, что стоит знать про этот код.
+A separate pass over all the code, assuming failure by default, found 18 problems, six of which had been introduced by earlier fixes. That is a result in itself: the round that declared itself converged was wrong. Here's what's worth knowing about this code.
 
-**Оптимизация внесла баг, а комментарий его замаскировал.** `select_related`
-рядом с `select_for_update` расширил блокировку на `auth_user`, и комментарий
-утверждал ровно обратное. Отсюда правило, которое теперь соблюдается по всему
-репозиторию: если комментарий утверждает поведение, рядом должен стоять тест,
-фиксирующий это поведение. Для блокировок это тест по тексту SQL, потому что
-поведенческий тест такую разницу не видит.
+**An optimization introduced a bug, and a comment hid it.** `select_related` next to `select_for_update` extended the lock to `auth_user`, and the comment claimed exactly the opposite. Hence the rule now followed across the whole repository: if a comment claims a behavior, there must be a test next to it pinning that behavior. For locks, that's a test on the SQL text, because a behavioral test can't see the difference.
 
-**Конфигурация не проверялась вообще, и почти все дефекты жили именно там.**
-Секреты запекались в образ через `COPY . .` без `.dockerignore`, `SECRET_KEY`
-имел публично известный дефолт, забытый `POSTGRES_HOST` тихо переводил
-приложение на SQLite, брокер Celery стоял с `allkeys-lru` и вытеснял сообщения,
-контейнер работал от root, а при `DEBUG=0` приложение не писало ни одного лога
-об ошибках. Ни один обычный тест такое не ловит, поэтому появился
-`tests/test_configuration.py`: он читает `Dockerfile`, `.dockerignore` и
-`docker-compose.yml` и проверяет их как контракт.
+**The configuration wasn't checked at all, and almost all the defects lived there.** Secrets were baked into the image through `COPY . .` without a `.dockerignore`, `SECRET_KEY` had a publicly known default, a forgotten `POSTGRES_HOST` silently switched the app to SQLite, the Celery broker ran with `allkeys-lru` and evicted messages, the container ran as root, and with `DEBUG=0` the app didn't log a single error. No ordinary test catches this, so `tests/test_configuration.py` was added: it reads the `Dockerfile`, `.dockerignore` and `docker-compose.yml` and checks them as a contract.
 
-**Каждое исправление здесь — отказ вместо тихой деградации.** Нет секрета —
-падаем на старте. Нет адреса базы — падаем, а не пишем в файл, который умрёт
-вместе с контейнером. Передали `Profile` вместо `User` — `TypeError`, а не
-обработка транзакций постороннего лица. Переименовали шаблон nginx — скрипт
-падает с кодом 1, а не поднимает наполовину собранный конфиг. Тихая деградация
-и есть тот класс аварий, который не видно ни в тестах, ни в мониторинге.
-
+**Every fix here is failing instead of degrading silently.** No secret means failing at startup. No database address means failing instead of writing to a file that dies with the container. Passing a `Profile` instead of a `User` raises `TypeError` instead of processing a stranger's transactions. A renamed nginx template makes the script fail with code 1 instead of bringing up a half-built config. Silent degradation is exactly the class of failure that tests and monitoring can't see.
 
 ---
 
-## Оптимизация: что измерено и что изменено
+## Optimization: what was measured and what was changed
 
-Отдельный проход, где каждое изменение опирается на замер, а не на интуицию.
-Четыре напрашивавшиеся оптимизации замер отклонил, они описаны ниже наравне с
-принятыми.
+A separate pass where every change rests on a measurement rather than intuition. The measurements rejected four tempting optimizations, and they are described below alongside the accepted ones.
 
-**Потоковая обработка вместо материализации набора.** Обычный обход queryset
-вычислял все строки в память до начала цикла. Измерено на 100 000 строк: пик
-69.9 MiB против 1.4 MiB с `iterator(chunk_size=2000)`, то есть минус 98
-процентов. В пересчёте на миллион строк это 699 MiB против 14 MiB. Здесь важна
-не скорость: без этого достаточно крупный клиент не обрабатывается вообще, воркер
-получает OOM-kill посреди открытой транзакции и после отката упирается в тот же
-предел снова.
+**Streaming instead of materializing the set.** Iterating a queryset the usual way loaded all rows into memory before the loop started. Measured on 100,000 rows: a peak of 69.9 MiB versus 1.4 MiB with `iterator(chunk_size=2000)`, which is 98 percent less. Scaled to a million rows, that's 699 MiB versus 14 MiB. Speed isn't the point here: without this a large enough client can't be processed at all, the worker gets OOM-killed in the middle of an open transaction and after the rollback hits the same limit again.
 
-**Индекс по `(user_id, id)`, и почему частичный вариант пришлось откатить.**
-Сначала здесь стоял частичный индекс: выборка запрашивает только необработанные
-транзакции, поэтому индексировать терминальные незачем. Замеры выглядели
-убедительно — 144 kB против 1288 kB, в девять раз меньше, выборка 2.49 мс
-против 3.32 мс.
+**An index on `(user_id, id)`, and why the partial version had to be rolled back.** At first there was a partial index here: the query asks only for unprocessed transactions, so there's no reason to index terminal ones. The measurements looked convincing: 144 kB versus 1288 kB, nine times smaller, and the query at 2.49 ms versus 3.32 ms.
 
-Это была регрессия. К колонке `user_id` ведёт не один путь, а как минимум два:
-кроме пакетной выборки есть каскадное удаление пользователя, которое ищет по
-`user_id` без всякого фильтра по статусу. На нём план деградировал до
-`Seq Scan` по всей таблице — замерено, 100 000 строк отфильтровано впустую.
-Для финтеха удаление аккаунта не гипотеза, а требование об удалении
-персональных данных.
+It was a regression. There isn't one path to the `user_id` column but at least two: besides the batch query, there's the cascading delete of a user, which looks up by `user_id` with no status filter at all. Its plan degraded to a `Seq Scan` over the whole table, measured at 100,000 rows filtered out for nothing. For fintech, deleting an account isn't hypothetical but a requirement for deleting personal data.
 
-Ошибка была не в индексе, а в методе: измерялся один запрос, а вывод делался
-про колонку. Теперь стоит обычный индекс по `(user_id, id)`, покрывающий оба
-пути, и оба они закрыты тестами на план.
+The mistake wasn't in the index but in the method: one query was measured, and the conclusion was drawn about the column. Now there's a plain index on `(user_id, id)` that covers both paths, and both are covered by plan tests.
 
-**Снят автоматический индекс ForeignKey.** Он был строгим префиксом составного и
-потому избыточен: 1280 kB и лишний индексный апдейт на каждую запись, при том что
-эта функция делает по одному UPDATE на строку.
+**The automatic ForeignKey index was removed.** It was a strict prefix of the composite one and so redundant: 1280 kB and an extra index update on every write, while this function does one UPDATE per row.
 
-**Миграция индексов взята в CONCURRENTLY.** Обычный `CREATE INDEX` держит на
-таблице SHARE и останавливает записи, `DROP INDEX` берёт ACCESS EXCLUSIVE и
-останавливает всё. На таблице транзакций работающего сервиса это минуты простоя
-внутри обычного деплоя. Плата за `atomic = False` названа в самой миграции.
+**Index migrations use CONCURRENTLY.** A regular `CREATE INDEX` holds SHARE on the table and blocks writes, and `DROP INDEX` takes ACCESS EXCLUSIVE and blocks everything. On a running service's transactions table that's minutes of downtime inside a normal deploy. The cost of `atomic = False` is stated in the migration itself.
 
-**Пул соединений вместо персистентных.** Было `psycopg2` с `CONN_MAX_AGE`, то
-есть число соединений равнялось произведению воркеров на реплики, а соединение в
-PostgreSQL это процесс ОС весом порядка десяти мегабайт. Теперь `psycopg3` с
-нативным пулом Django. Django запрещает сочетать пул с персистентными
-соединениями, поэтому `CONN_MAX_AGE` здесь обязан быть нулём — это требование
-бэкенда, а не оплошность. `DB_POOL=0` оставлен для случая, когда впереди стоит
-PgBouncer.
+**A connection pool instead of persistent connections.** It used to be `psycopg2` with `CONN_MAX_AGE`, so the number of connections equaled workers times replicas, and a PostgreSQL connection is an OS process of about ten megabytes. Now it's `psycopg3` with Django's native pool. Django forbids combining the pool with persistent connections, so `CONN_MAX_AGE` has to be zero here; that's a backend requirement, not an oversight. `DB_POOL=0` is left for the case where PgBouncer sits in front.
 
-**gthread вместо синхронной модели.** Приложение ждёт Postgres и Redis, а не
-считает, но три синхронных воркера обслуживали ровно три запроса одновременно.
-Число потоков согласовано с размером пула: соединения Django потоко-локальны, и
-без пула такая замена умножила бы нагрузку на базу вместо того, чтобы её снять.
-Порядок здесь важен, менять по отдельности нельзя.
+**gthread instead of the sync model.** The app waits on Postgres and Redis rather than computing, but three sync workers served exactly three requests at a time. The thread count matches the pool size: Django connections are thread-local, and without a pool this change would multiply the load on the database instead of reducing it. Order matters here, and the two can't be changed separately.
 
-**Порог перезапуска воркера поднят с 1000 до 10000.** Измерено: `django.setup()`
-стоит 153 мс, и при сотне запросов в секунду на воркер прежний порог
-перезапускал его каждые десять секунд, теряя около двух процентов ёмкости ради
-защиты от утечки, которой в этом коде нет.
+**The worker restart threshold went from 1000 to 10000.** Measured: `django.setup()` costs 153 ms, and at a hundred requests per second per worker, the old threshold restarted it every ten seconds, losing about two percent of capacity to guard against a leak this code doesn't have.
 
-**Healthcheck воркера больше не поднимает интерпретатор и не трогает брокер.**
-Было `celery inspect ping`: измерено 0.47–0.64 с на вызов из-за полного импорта
-Django и Celery, плюс широковещательный запрос, который обрабатывают все воркеры
-— служебный трафик растёт квадратично по числу контейнеров. Стал файловый
-heartbeat. Ограничение названо честно в самом модуле: это проверка живости
-процесса, а воркер, который жив, но отвалился от очереди, отсюда выглядит
-здоровым; вторую половину закрывает метрика глубины очереди, а не healthcheck.
+**The worker healthcheck no longer starts an interpreter or touches the broker.** It used to be `celery inspect ping`: measured at 0.47–0.64 s per call because of the full Django and Celery import, plus a broadcast request that all workers handle, so the service traffic grows quadratically with the number of containers. Now it's a file heartbeat. The limitation is stated honestly in the module itself: this checks that the process is alive, and a worker that's alive but disconnected from the queue looks healthy from here; the other half is covered by a queue depth metric, not a healthcheck.
 
-**Сжатие и ограничение частоты на периметре.** `gzip` не был включён вовсе,
-проверено: 6000 байт против 42 после включения. `limit_req` отсутствовал, теперь
-один клиент не занимает всю ёмкость пула воркеров, проверено на стенде — шесть
-ответов 200, дальше 429.
+**Compression and rate limiting at the perimeter.** `gzip` wasn't enabled at all, verified: 6000 bytes versus 42 after enabling it. `limit_req` was missing; now one client can't take the whole worker pool's capacity, verified on the stack: six 200 responses, then 429.
 
-**Статика с хешированием имён.** Вечный кэш на стабильных именах означал, что
-часть пользователей после деплоя месяц работает со старой статикой. С
-`ManifestStaticFilesStorage` имя содержит хеш содержимого, поэтому
-`immutable` становится корректным.
+**Static files with hashed names.** A permanent cache on stable names meant that some users worked with old static files for a month after a deploy. With `ManifestStaticFilesStorage` the name contains a hash of the content, so `immutable` becomes correct.
 
-**Структурированные логи, и две ловушки Celery по дороге.** Первая:
-`worker_hijack_root_logger` по умолчанию `True`, поэтому Celery подменяет
-обработчики корневого логгера и весь блок `LOGGING` внутри воркера игнорируется —
-половина системы писала бы текстом, пока вторая пишет JSON. Вторая вскрылась
-сразу после исправления первой: `celery.worker.strategy` печатает на INFO
-полный список аргументов задачи, и в записи оказалось
-`"args": "(11, {'lat': Decimal('1'), 'ts': 5000})"`. Это координаты
-пользователя, то есть персональные данные, утекающие в систему сбора логов на
-весь её срок хранения. Оба логгера приглушены до WARNING.
+**Structured logs, and two Celery traps along the way.** First: `worker_hijack_root_logger` is `True` by default, so Celery replaces the root logger's handlers and the whole `LOGGING` block is ignored inside the worker; half the system would write text while the other half writes JSON. The second showed up right after fixing the first: `celery.worker.strategy` prints the full list of task arguments at INFO, and the record contained `"args": "(11, {'lat': Decimal('1'), 'ts': 5000})"`. Those are user coordinates, meaning personal data leaking into the log collection system for its whole retention period. Both loggers are turned down to WARNING.
 
-**Прочее.** Пул Redis ограничен сверху, у контейнеров появились лимиты памяти и
-CPU, `COPY --chown` вместо отдельного `chown -R`, который дублировал слой,
-`curl` убран из образа в пользу штатного `urllib`, `PROCESSABLE_STATUSES` стал
-кортежем ради стабильного порядка значений в `IN` и целой статистики в
-`pg_stat_statements`.
+**Other.** The Redis pool has an upper bound, containers got memory and CPU limits, `COPY --chown` replaced a separate `chown -R` that duplicated a layer, `curl` was removed from the image in favor of the standard `urllib`, and `PROCESSABLE_STATUSES` became a tuple for a stable order of values in `IN` and consistent statistics in `pg_stat_statements`.
 
-### Отклонено после замера
+### Rejected after measurement
 
-Это самая полезная часть, потому что три из четырёх выглядели убедительно.
+This is the most useful part, because three of the four looked convincing.
 
-Сузить выборку до `only("pk", "status")` бессмысленно: 736 байт на строку против
-682, экономия семь процентов. Накладные расходы объекта модели доминируют над
-значениями полей, а взамен получаешь отложенные поля, обращение к которым молча
-делает лишний запрос. Ту же проблему решает `iterator()`, дающий 98 процентов.
+Narrowing the query to `only("pk", "status")` is pointless: 736 bytes per row versus 682, a seven percent saving. The model object's overhead dominates the field values, and in return you get deferred fields, where accessing one silently makes an extra query. `iterator()` solves the same problem and gives 98 percent.
 
-Добавить `id` в составной индекс, чтобы убрать узел сортировки, не работает:
-измерено, `Sort` остаётся. `status IN (...)` с несколькими значениями разрушает
-гарантию порядка по `id`. Выигрыш, который тогда приписали порядку колонок, на деле давала
-частичность индекса — та самая, которую позже пришлось откатить как регрессию.
+Adding `id` to the composite index to remove the sort node doesn't work: measured, the `Sort` stays. `status IN (...)` with several values breaks the ordering guarantee by `id`. The gain that was attributed to the column order at the time actually came from the index being partial, the same partiality that later had to be rolled back as a regression.
 
-Отложить импорт Celery ради времени старта не даёт ничего: `django.setup()`
-стоит 153 мс, добавление `import config` не добавляет ничего в пределах шума.
+Deferring the Celery import for startup time gives nothing: `django.setup()` costs 153 ms, and adding `import config` adds nothing within the noise.
 
-Переиспользовать экземпляр энкодера вместо `cls=` в `json.dumps` — микро­
-оптимизация ниже уровня шума, не стоит потери читаемости.
+Reusing an encoder instance instead of `cls=` in `json.dumps` is a micro-optimization below the noise level and not worth the loss in readability.
 
-### Осталось нерешённым сознательно
+### Left unresolved on purpose
 
-Обработка переполнения брокера не написана, потому что писать её не к чему: в продакшн-коде нет ни одного вызова `.delay()` — условие просило таск, а не встроенный в приложение вызывающий код. Добавлять вью или сигнал ради демонстрации обработки значило бы придумать постановку за автора.
+Handling a full broker isn't written because there's nothing to attach it to: the production code has no `.delay()` call at all. The statement asked for a task, not calling code built into the application. Adding a view or a signal just to demonstrate the handling would mean inventing requirements for the author.
 
-Построчная блокировка транзакций удерживается вместе с блокировкой профиля, хотя мьютексом служит именно профиль. Снять её — решение, а не правка: оно требует ответа на вопрос, есть ли другие писатели по таблице, а этого знания внутри задания нет.
+The row-level lock on transactions is held together with the profile lock, even though the profile is what serves as the mutex. Removing it is a decision, not an edit: it needs an answer to whether the table has other writers, and that knowledge isn't inside the task.
 
-Ограничение частоты в nginx считает клиентов по `$binary_remote_addr` и за балансировщиком видело бы один адрес. Чинится это директивой `real_ip_header` вместе со списком доверенных диапазонов, а список зависит от того, что стоит перед nginx. Добавить заголовок без диапазонов было бы хуже, чем не добавлять ничего: тогда любой клиент подделает адрес и обойдёт ограничение.
+The nginx rate limit counts clients by `$binary_remote_addr` and behind a load balancer would see one address. This is fixed with the `real_ip_header` directive together with a list of trusted ranges, and the list depends on what sits in front of nginx. Adding the header without the ranges would be worse than adding nothing: any client could then spoof its address and bypass the limit.
 
-Пул keepalive до gunicorn отсутствует, потому что `proxy_pass` через переменную
-несовместим с `upstream`-блоком, а переменная выбрана ради устойчивости к смене
-IP контейнера при деплое. Цена измерена и она жёсткая: в контейнере 28 232
-эфемерных порта при `tcp_fin_timeout` 60, то есть потолок примерно 470 новых
-соединений в секунду, после чего начинаются 502 при чистых метриках приложения.
-Это не чинится правкой конфига: нужно отдать service discovery слою, который для
-этого предназначен (оркестратор со стабильным VIP, Traefik, Caddy), и только
-тогда возвращать `upstream` с `keepalive`. Решение об архитектуре периметра
-выходит за рамки этого прохода, поэтому оно названо, а не сделано наспех.
+There's no keepalive pool to gunicorn, because `proxy_pass` through a variable is incompatible with an `upstream` block, and the variable was chosen for resilience to the container's IP changing on deploy. The cost is measured and it's hard: the container has 28,232 ephemeral ports with `tcp_fin_timeout` 60, so the ceiling is about 470 new connections per second, after which 502s start while the application's metrics look clean. This isn't fixed by a config change: service discovery has to be handed to a layer built for it (an orchestrator with a stable VIP, Traefik, Caddy), and only then can `upstream` with `keepalive` come back. The decision about the perimeter architecture is outside the scope of this pass, so it's named rather than done in a hurry.
